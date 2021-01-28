@@ -170,7 +170,7 @@ pub struct Opt {
     #[structopt(
         long,
         value_name = "MILLISECONDS",
-        default_value = "1000",
+        default_value = "300",
         env = "ETHEREUM_POLLING_INTERVAL",
         help = "How often to poll the Ethereum node for new blocks"
     )]

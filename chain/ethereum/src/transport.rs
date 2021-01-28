@@ -40,7 +40,7 @@ impl Transport {
     pub fn new_rpc(rpc: &str) -> (EventLoopHandle, Self) {
         let max_parallel_http: usize = env::var_os("ETHEREUM_RPC_MAX_PARALLEL_REQUESTS")
             .map(|s| s.to_str().unwrap().parse().unwrap())
-            .unwrap_or(64);
+            .unwrap_or(128);
 
         let cfg = ETHEREUM_CONFIG.rpc.get(rpc);
         let headers = cfg.map(|cfg| cfg.http_headers.clone()).unwrap_or_default();
