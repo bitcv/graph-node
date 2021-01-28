@@ -399,7 +399,7 @@ impl RuntimeHost {
         proof_of_indexing: SharedProofOfIndexing,
     ) -> Result<BlockState, MappingError> {
         let trigger_type = trigger.as_static();
-        debug!(
+        info!(
             logger, "Start processing Ethereum trigger";
             &extra,
             "trigger_type" => trigger_type,
