@@ -20,15 +20,15 @@ graph-chain-ethereum = { path = "../../chain/ethereum" }
 graph-graphql = { path = "../../graphql" }
 graphql-parser = "0.3"
 Inflector = "0.11.3"
-lazy_static = "1.1"
+lazy_static = "1.4.0"
 lru_time_cache = "0.11"
 maybe-owned = "0.3.4"
 postgres = "0.15.2"
-rand = "0.6.1"
-serde = "1.0"
+rand = "0.7.3"
+serde = "1.0.123"
 uuid = { version = "0.8.1", features = ["v4"] }
 stable-hash = { git = "https://github.com/graphprotocol/stable-hash" }
-backtrace = "0.3"
+backtrace = "0.3.56"
 
 [dev-dependencies]
 clap = "2.33.3"

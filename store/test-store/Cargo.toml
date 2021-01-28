@@ -12,6 +12,6 @@ graph-mock = { path = "../../mock" }
 graph-node = { path = "../../node" }
 graph = { path = "../../graph" }
 graph-store-postgres = { path = "../postgres" }
-lazy_static = "1.1"
+lazy_static = "1.4.0"
 hex-literal = "0.3"
 diesel = { version = "1.4.5", features = ["postgres", "serde_json", "numeric", "r2d2"] }

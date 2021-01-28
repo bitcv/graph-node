@@ -14,7 +14,7 @@ graph-graphql = { path = "../../graphql" }
 bs58 = "0.4.0"
 graph-runtime-derive = { path = "../derive" }
 semver = "0.10.0"
-lazy_static = "1.4"
+lazy_static = "1.4.0"
 uuid = { version = "0.8.1", features = ["v4"] }
 strum = "0.20.0"
 strum_macros = "0.20.1"
@@ -29,5 +29,5 @@ graphql-parser = "0.3"
 graph-core = { path = "../../core" }
 graph-mock = { path = "../../mock" }
 test-store = { path = "../../store/test-store" }
-ipfs-api = { version = "=0.7.1", features = ["hyper-tls"] }
+ipfs-api = { version = "=0.7.2", features = ["hyper-tls"] }
 graph-chain-arweave = { path = "../../chain/arweave" }

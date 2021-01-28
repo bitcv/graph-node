@@ -4,10 +4,10 @@ version = "0.21.1"
 edition = "2018"
 
 [dependencies]
-futures = "0.1.21"
+futures = "0.3.12"
 graph = { path = "../../graph" }
-http = "0.2"
-hyper = "0.13"
-lazy_static = "1.2.0"
-serde = "1.0"
+http = "0.2.3"
+hyper = "0.13.9"
+lazy_static = "1.4.0"
+serde = "1.0.123"
 prometheus = "0.7"

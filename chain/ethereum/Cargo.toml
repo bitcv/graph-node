@@ -9,11 +9,11 @@ futures = "0.1.21"
 hyper = "0.12.25" # must be compatible with the version rust-web3 uses
 jsonrpc-core = "14.2.0"
 graph = { path = "../../graph" }
-lazy_static = "1.2.0"
+lazy_static = "1.4.0"
 state_machine_future = "0.2"
-serde = "1.0"
+serde = "1.0.123"
 config = { version = "0.10", features = ["toml"], default-features = false }
-dirs = "3.0"
+dirs = "3.0.1"
 anyhow = "1.0"
 fail = "0.4"
 

@@ -101,6 +101,13 @@ fn read_expensive_queries() -> Result<Vec<Arc<q::Document>>, std::io::Error> {
 async fn main() {
     env_logger::init();
 
+    let client = IpfsClient::default();
+
+    match client.version().await {
+	Ok(version) => eprintln!("version: {:?}", version.version),
+	Err(e) => eprintln!("error getting version: {}", e),
+   }
+
     // Allow configuring fail points on debug builds. Used for integration tests.
     #[cfg(debug_assertions)]
     std::mem::forget(fail::FailScenario::setup());
@@ -639,15 +646,29 @@ fn create_ipfs_clients(logger: &Logger, ipfs_addresses: &Vec<String>) -> Vec<Ipf
             let ipfs_test = ipfs_client.clone();
             let ipfs_ok_logger = logger.clone();
             let ipfs_err_logger = logger.clone();
+            let ipfs_test_logger = logger.clone();
             let ipfs_address_for_ok = ipfs_address.clone();
             let ipfs_address_for_err = ipfs_address.clone();
+            let ipfs_address_for_test = ipfs_address.clone();
+            info!(ipfs_test_logger, "connecting {}", SafeDisplay(ipfs_address_for_test));
+
+
+	    //let ipfs_log_client = ipfs_client.clone();
+	    // let res = ipfs_log_client.version();
+            // info!(ipfs_test_logger, "version {:?}", res.VersionResponse);
+	     //match ipfs_log_client.version().await {
+	      //  Ok(version) => info!("version: {:?}", version.version),
+	//	Err(e) => eprintln!("error getting version: {}", e),
+	  //  }
+   
+	   
             graph::spawn(async move {
                 ipfs_test
                     .version()
                     .map_err(move |e| {
                         error!(
                             ipfs_err_logger,
-                            "Is there an IPFS node running at \"{}\"?",
+                            "Is there an IPFS node running at \"{}\" realy?",
                             SafeDisplay(ipfs_address_for_err),
                         );
                         panic!("Failed to connect to IPFS: {}", e);
