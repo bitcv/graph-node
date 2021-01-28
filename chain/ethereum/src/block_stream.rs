@@ -22,7 +22,7 @@ lazy_static! {
 
     /// Ideal number of triggers in a range. The range size will adapt to try to meet this.
     static ref TARGET_TRIGGERS_PER_BLOCK_RANGE: u64 = std::env::var("GRAPH_ETHEREUM_TARGET_TRIGGERS_PER_BLOCK_RANGE")
-        .unwrap_or("1000".into())
+        .unwrap_or("2000".into())
         .parse::<u64>()
         .expect("invalid GRAPH_ETHEREUM_TARGET_TRIGGERS_PER_BLOCK_RANGE");
 }
