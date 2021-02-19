@@ -2,10 +2,10 @@ use mockall::predicate::*;
 use mockall::*;
 use std::collections::BTreeMap;
 
-use graph::components::{server::index_node::VersionInfo, store::StoredDynamicDataSource};
+use graph::components::store::EntityType;
+use graph::components::store::StoredDynamicDataSource;
 use graph::data::subgraph::schema::SubgraphError;
 use graph::prelude::*;
-use graph::{components::store::EntityType, data::subgraph::status};
 use web3::types::{Address, H256};
 
 mock! {
@@ -55,7 +55,7 @@ mock! {
 }
 
 #[async_trait]
-impl Store for MockStore {
+impl SubgraphStore for MockStore {
     fn block_ptr(
         &self,
         _subgraph_id: &SubgraphDeploymentId,
@@ -122,11 +122,14 @@ impl Store for MockStore {
         unimplemented!()
     }
 
-    fn deployment_state_from_name(&self, _: SubgraphName) -> Result<DeploymentState, StoreError> {
+    async fn deployment_state_from_name(
+        &self,
+        _: SubgraphName,
+    ) -> Result<DeploymentState, StoreError> {
         unimplemented!()
     }
 
-    fn deployment_state_from_id(
+    async fn deployment_state_from_id(
         &self,
         id: SubgraphDeploymentId,
     ) -> Result<DeploymentState, StoreError> {
@@ -182,15 +185,15 @@ impl Store for MockStore {
         unimplemented!()
     }
 
+    fn unfail(&self, _: &SubgraphDeploymentId) -> Result<(), StoreError> {
+        unimplemented!()
+    }
+
     fn is_deployment_synced(&self, _: &SubgraphDeploymentId) -> Result<bool, Error> {
         unimplemented!()
     }
 
     fn deployment_synced(&self, _: &SubgraphDeploymentId) -> Result<(), Error> {
-        unimplemented!()
-    }
-
-    fn status(&self, _: status::Filter) -> Result<Vec<status::Info>, StoreError> {
         unimplemented!()
     }
 
@@ -221,18 +224,7 @@ impl Store for MockStore {
         unimplemented!()
     }
 
-    fn network_name(&self, _: &SubgraphDeploymentId) -> Result<Option<String>, StoreError> {
-        unimplemented!()
-    }
-
-    fn version_info(&self, _: &str) -> Result<VersionInfo, StoreError> {
-        unimplemented!()
-    }
-
-    fn versions_for_subgraph_id(
-        &self,
-        _: &str,
-    ) -> Result<(Option<String>, Option<String>), StoreError> {
+    fn network_name(&self, _: &SubgraphDeploymentId) -> Result<String, StoreError> {
         unimplemented!()
     }
 }

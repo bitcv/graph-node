@@ -37,6 +37,19 @@ pub enum SubgraphHealth {
     Unhealthy,
 }
 
+impl From<SubgraphHealth> for graph::data::subgraph::schema::SubgraphHealth {
+    fn from(health: SubgraphHealth) -> Self {
+        use graph::data::subgraph::schema::SubgraphHealth as H;
+        use SubgraphHealth as Db;
+
+        match health {
+            Db::Failed => H::Failed,
+            Db::Healthy => H::Healthy,
+            Db::Unhealthy => H::Unhealthy,
+        }
+    }
+}
+
 table! {
     subgraphs.subgraph_deployment (vid) {
         vid -> BigInt,
@@ -120,6 +133,8 @@ table! {
         block_range -> Range<Integer>,
     }
 }
+
+allow_tables_to_appear_in_same_query!(subgraph_deployment, subgraph_error);
 
 /// Look up the graft point for the given subgraph in the database and
 /// return it. If `pending_only` is `true`, only return `Some(_)` if the
@@ -211,30 +226,6 @@ pub fn manifest_info(
     Schema::parse(s.as_str(), id)
         .map_err(|e| StoreError::Unknown(e))
         .map(|schema| (schema, description, repository))
-}
-
-pub fn network(
-    conn: &PgConnection,
-    id: &SubgraphDeploymentId,
-) -> Result<Option<String>, StoreError> {
-    use ethereum_contract_data_source as ds;
-    use subgraph_manifest as sm;
-
-    let manifest_id = SubgraphManifestEntity::id(&id);
-    let data_sources: Vec<String> = sm::table
-        .select(sm::data_sources)
-        .filter(sm::id.eq(manifest_id.as_str()))
-        .first::<Vec<String>>(conn)?;
-    // The NetworkIndexer creates a manifest with an empty
-    // array of data sources and we therefore accept 'None'
-    // here
-    match data_sources.first() {
-        Some(ds_id) => Ok(ds::table
-            .select(ds::network)
-            .filter(ds::id.eq(&ds_id))
-            .first::<Option<String>>(conn)?),
-        None => Ok(None),
-    }
 }
 
 pub fn features(
@@ -531,6 +522,7 @@ pub(crate) fn has_non_fatal_errors(
 /// healthy or unhealthy depending on whether it also had non-fatal errors
 pub fn unfail(conn: &PgConnection, id: &SubgraphDeploymentId) -> Result<(), StoreError> {
     use subgraph_deployment as d;
+    use subgraph_error as e;
     use SubgraphHealth::*;
 
     let prev_health = if has_non_fatal_errors(conn, id, None)? {
@@ -539,18 +531,29 @@ pub fn unfail(conn: &PgConnection, id: &SubgraphDeploymentId) -> Result<(), Stor
         Healthy
     };
 
-    // The update does nothing unless the subgraph is in state 'failed'
-    update(
-        d::table
-            .filter(d::id.eq(id.as_str()))
-            .filter(d::health.eq(Failed)),
-    )
-    .set((
-        d::failed.eq(false),
-        d::health.eq(prev_health),
-        d::fatal_error.eq::<Option<String>>(None),
-    ))
-    .execute(conn)?;
+    let fatal_error_id = match d::table
+        .filter(d::id.eq(id.as_str()))
+        .select(d::fatal_error)
+        .get_result::<Option<String>>(conn)?
+    {
+        Some(fatal_error_id) => fatal_error_id,
+
+        // If the subgraph is not failed then there is nothing to do.
+        None => return Ok(()),
+    };
+
+    // Unfail the deployment.
+    update(d::table.filter(d::id.eq(id.as_str())))
+        .set((
+            d::failed.eq(false),
+            d::health.eq(prev_health),
+            d::fatal_error.eq::<Option<String>>(None),
+        ))
+        .execute(conn)?;
+
+    // Delete the fatal error.
+    delete(e::table.filter(e::id.eq(fatal_error_id))).execute(conn)?;
+
     Ok(())
 }
 
@@ -559,12 +562,13 @@ pub(crate) fn insert_subgraph_errors(
     conn: &PgConnection,
     id: &SubgraphDeploymentId,
     deterministic_errors: Vec<SubgraphError>,
+    block: BlockNumber,
 ) -> Result<(), StoreError> {
     for error in deterministic_errors {
         insert_subgraph_error(conn, error)?;
     }
 
-    check_health(conn, id)
+    check_health(conn, id, block)
 }
 
 #[cfg(debug_assertions)]
@@ -580,13 +584,16 @@ pub(crate) fn error_count(
         .get_result::<i64>(conn)? as usize)
 }
 
-/// Checks if the subgraph is healthy or unhealthy as of the latest block, based on the presence of
-/// deterministic errors. Has no effect on failed subgraphs.
-fn check_health(conn: &PgConnection, id: &SubgraphDeploymentId) -> Result<(), StoreError> {
+/// Checks if the subgraph is healthy or unhealthy as of the given block, or the subgraph latest
+/// block if `None`, based on the presence of non-fatal errors. Has no effect on failed subgraphs.
+fn check_health(
+    conn: &PgConnection,
+    id: &SubgraphDeploymentId,
+    block: BlockNumber,
+) -> Result<(), StoreError> {
     use subgraph_deployment as d;
 
-    // Errors have unbounded upper bounds so if one exists, it exists as of the latest block.
-    let has_errors = has_non_fatal_errors(conn, id, None)?;
+    let has_errors = has_non_fatal_errors(conn, id, Some(block))?;
 
     let (new, old) = match has_errors {
         true => (SubgraphHealth::Unhealthy, SubgraphHealth::Healthy),
@@ -620,7 +627,10 @@ pub(crate) fn revert_subgraph_errors(
     )
     .execute(conn)?;
 
-    check_health(conn, id)
+    // The result will be the same at `reverted_block` or `reverted_block - 1` since the errors at
+    // `reverted_block` were just deleted, but semantically we care about `reverted_block - 1` which
+    // is the block being reverted to.
+    check_health(conn, id, reverted_block - 1)
 }
 
 /// Drop the schema `namespace`. This deletes all data for the subgraph,

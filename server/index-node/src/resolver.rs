@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 
-use graph::data::graphql::{IntoValue, ObjectOrInterface, ValueMap};
 use graph::data::subgraph::status;
 use graph::prelude::*;
+use graph::{
+    components::store::StatusStore,
+    data::graphql::{IntoValue, ObjectOrInterface, ValueMap},
+};
 use graph_graphql::prelude::{ExecutionContext, Resolver};
 use std::convert::TryInto;
 use web3::types::{Address, H256};
@@ -17,7 +20,7 @@ pub struct IndexNodeResolver<R, S> {
 impl<R, S> IndexNodeResolver<R, S>
 where
     R: GraphQlRunner,
-    S: Store,
+    S: StatusStore,
 {
     pub fn new(logger: &Logger, graphql_runner: Arc<R>, store: Arc<S>) -> Self {
         let logger = logger.new(o!("component" => "IndexNodeResolver"));
@@ -157,7 +160,7 @@ where
 impl<R, S> Clone for IndexNodeResolver<R, S>
 where
     R: GraphQlRunner,
-    S: Store,
+    S: SubgraphStore,
 {
     fn clone(&self) -> Self {
         Self {
@@ -171,7 +174,7 @@ where
 impl<R, S> Resolver for IndexNodeResolver<R, S>
 where
     R: GraphQlRunner,
-    S: Store,
+    S: StatusStore,
 {
     const CACHEABLE: bool = false;
 

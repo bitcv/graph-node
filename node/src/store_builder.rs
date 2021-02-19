@@ -1,50 +1,61 @@
 use std::iter::FromIterator;
 use std::{collections::HashMap, sync::Arc};
 
-use graph::prelude::{o, MetricsRegistry};
+use graph::prelude::{o, MetricsRegistry, NodeId};
 use graph::{
     prelude::{info, CheapClone, EthereumNetworkIdentifier, Logger},
     util::security::SafeDisplay,
 };
 use graph_store_postgres::connection_pool::ConnectionPool;
 use graph_store_postgres::{
-    ChainHeadUpdateListener as PostgresChainHeadUpdateListener, ChainStore as DieselChainStore,
-    NetworkStore as DieselNetworkStore, Shard as ShardName, ShardedStore, Store as DieselStore,
-    SubscriptionManager, PRIMARY_SHARD,
+    BlockStore as DieselBlockStore, ChainHeadUpdateListener as PostgresChainHeadUpdateListener,
+    Shard as ShardName, Store as DieselStore, SubgraphStore, SubscriptionManager, PRIMARY_SHARD,
 };
 
 use crate::config::{Config, Shard};
 
 pub struct StoreBuilder {
-    store: Arc<ShardedStore>,
-    primary_pool: ConnectionPool,
-    chain_head_update_listener: Arc<PostgresChainHeadUpdateListener>,
+    logger: Logger,
+    subgraph_store: Arc<SubgraphStore>,
+    pools: HashMap<ShardName, ConnectionPool>,
+    primary_shard: Shard,
     subscription_manager: Arc<SubscriptionManager>,
+    registry: Arc<dyn MetricsRegistry>,
+    /// Map network names to the shards where they are/should be stored
+    chains: HashMap<String, ShardName>,
 }
 
 impl StoreBuilder {
-    pub fn new(logger: &Logger, config: &Config, registry: Arc<dyn MetricsRegistry>) -> Self {
-        let primary = config.primary_store();
+    pub fn new(
+        logger: &Logger,
+        node: &NodeId,
+        config: &Config,
+        registry: Arc<dyn MetricsRegistry>,
+    ) -> Self {
+        let primary_shard = config.primary_store().clone();
 
         let subscription_manager = Arc::new(SubscriptionManager::new(
             logger.cheap_clone(),
-            primary.connection.to_owned(),
+            primary_shard.connection.to_owned(),
         ));
 
-        let (store, primary_pool) =
-            Self::make_sharded_store_and_primary_pool(logger, config, registry.cheap_clone());
+        let (store, pools) =
+            Self::make_sharded_store_and_primary_pool(logger, node, config, registry.cheap_clone());
 
-        let chain_head_update_listener = Arc::new(PostgresChainHeadUpdateListener::new(
-            &logger,
-            registry.cheap_clone(),
-            primary.connection.to_owned(),
-        ));
+        let chains = HashMap::from_iter(config.chains.chains.iter().map(|(name, chain)| {
+            let shard = ShardName::new(chain.shard.to_string())
+                .expect("config validation catches invalid names");
+            (name.to_string(), shard)
+        }));
 
         Self {
-            store,
-            primary_pool,
-            chain_head_update_listener,
+            logger: logger.cheap_clone(),
+            subgraph_store: store,
+            pools,
             subscription_manager,
+            primary_shard,
+            registry,
+            chains,
         }
     }
 
@@ -52,31 +63,40 @@ impl StoreBuilder {
     /// the connection pool for the primary shard
     fn make_sharded_store_and_primary_pool(
         logger: &Logger,
+        node: &NodeId,
         config: &Config,
         registry: Arc<dyn MetricsRegistry>,
-    ) -> (Arc<ShardedStore>, ConnectionPool) {
+    ) -> (Arc<SubgraphStore>, HashMap<ShardName, ConnectionPool>) {
         let shards: Vec<_> = config
             .stores
             .iter()
-            .map(|(name, shard)| Self::make_shard(logger, name, shard, registry.cheap_clone()))
+            .map(|(name, shard)| {
+                let logger = logger.new(o!("shard" => name.to_string()));
+                let conn_pool = Self::main_pool(&logger, node, name, shard, registry.cheap_clone());
+
+                let (read_only_conn_pools, weights) =
+                    Self::replica_pools(&logger, node, name, shard, registry.cheap_clone());
+
+                let name =
+                    ShardName::new(name.to_string()).expect("shard names have been validated");
+                (name, conn_pool, read_only_conn_pools, weights)
+            })
             .collect();
 
-        let primary_pool = shards
-            .iter()
-            .find(|(name, _, _)| name.as_str() == PRIMARY_SHARD.as_str())
-            .unwrap()
-            .2
-            .clone();
+        let pools: HashMap<_, _> = HashMap::from_iter(
+            shards
+                .iter()
+                .map(|(name, pool, _, _)| (name.clone(), pool.clone())),
+        );
 
-        let shard_map =
-            HashMap::from_iter(shards.into_iter().map(|(name, shard, _)| (name, shard)));
-
-        let store = Arc::new(ShardedStore::new(
-            shard_map,
+        let store = Arc::new(SubgraphStore::new(
+            logger,
+            shards,
             Arc::new(config.deployment.clone()),
+            registry.cheap_clone(),
         ));
 
-        (store, primary_pool)
+        (store, pools)
     }
 
     // Somehow, rustc gets this wrong; the function is used in
@@ -84,56 +104,39 @@ impl StoreBuilder {
     #[allow(dead_code)]
     pub fn make_sharded_store(
         logger: &Logger,
+        node: &NodeId,
         config: &Config,
         registry: Arc<dyn MetricsRegistry>,
-    ) -> Arc<ShardedStore> {
-        Self::make_sharded_store_and_primary_pool(logger, config, registry).0
-    }
-
-    fn make_shard(
-        logger: &Logger,
-        name: &str,
-        shard: &Shard,
-        registry: Arc<dyn MetricsRegistry>,
-    ) -> (ShardName, Arc<DieselStore>, ConnectionPool) {
-        let logger = logger.new(o!("shard" => name.to_string()));
-        let conn_pool = Self::main_pool(&logger, name, shard, registry.cheap_clone());
-
-        let (read_only_conn_pools, weights) =
-            Self::replica_pools(&logger, name, shard, registry.cheap_clone());
-
-        let shard = Arc::new(DieselStore::new(
-            &logger,
-            conn_pool.clone(),
-            read_only_conn_pools.clone(),
-            weights,
-            registry.cheap_clone(),
-        ));
-        let name = ShardName::new(name.to_string()).expect("shard names have been validated");
-        (name, shard, conn_pool)
+    ) -> Arc<SubgraphStore> {
+        Self::make_sharded_store_and_primary_pool(logger, node, config, registry).0
     }
 
     /// Create a connection pool for the main database of hte primary shard
     /// without connecting to all the other configured databases
     pub fn main_pool(
         logger: &Logger,
+        node: &NodeId,
         name: &str,
         shard: &Shard,
         registry: Arc<dyn MetricsRegistry>,
     ) -> ConnectionPool {
         let logger = logger.new(o!("pool" => "main"));
+        let pool_size = shard.pool_size.size_for(node, name).expect(&format!(
+            "we can determine the pool size for store {}",
+            name
+        ));
         info!(
             logger,
             "Connecting to Postgres";
             "url" => SafeDisplay(shard.connection.as_str()),
-            "conn_pool_size" => shard.pool_size,
+            "conn_pool_size" => pool_size,
             "weight" => shard.weight
         );
         ConnectionPool::create(
             name,
             "main",
             shard.connection.to_owned(),
-            shard.pool_size,
+            pool_size,
             &logger,
             registry.cheap_clone(),
         )
@@ -142,6 +145,7 @@ impl StoreBuilder {
     /// Create connection pools for each of the replicas
     fn replica_pools(
         logger: &Logger,
+        node: &NodeId,
         name: &str,
         shard: &Shard,
         registry: Arc<dyn MetricsRegistry>,
@@ -162,11 +166,15 @@ impl StoreBuilder {
                         "weight" => replica.weight
                     );
                     weights.push(replica.weight);
+                    let pool_size = replica.pool_size.size_for(node, name).expect(&format!(
+                        "we can determine the pool size for replica {}",
+                        name
+                    ));
                     ConnectionPool::create(
                         name,
                         pool,
                         replica.connection.clone(),
-                        replica.pool_size,
+                        pool_size,
                         &logger,
                         registry.cheap_clone(),
                     )
@@ -176,28 +184,42 @@ impl StoreBuilder {
         )
     }
 
-    /// Return a store that includes a `ChainStore` for the given network
+    /// Return a store that combines both a `Store` for subgraph data
+    /// and a `BlockStore` for all chain related data
     pub fn network_store(
-        &self,
-        network_name: String,
-        network_identifier: EthereumNetworkIdentifier,
-    ) -> Arc<DieselNetworkStore> {
-        let chain_store = DieselChainStore::new(
-            network_name,
-            network_identifier,
-            self.chain_head_update_listener.cheap_clone(),
-            self.primary_pool.clone(),
-        );
-        Arc::new(DieselNetworkStore::new(
-            self.store.cheap_clone(),
-            Arc::new(chain_store),
-        ))
-    }
+        self,
+        networks: Vec<(String, EthereumNetworkIdentifier)>,
+    ) -> Arc<DieselStore> {
+        let chain_head_update_listener = Arc::new(PostgresChainHeadUpdateListener::new(
+            &self.logger,
+            self.registry.cheap_clone(),
+            self.primary_shard.connection.to_owned(),
+        ));
 
-    /// Return the store for subgraph and other storage; this store can
-    /// handle everything besides being a `ChainStore`
-    pub fn store(&self) -> Arc<ShardedStore> {
-        self.store.cheap_clone()
+        let networks = networks
+            .into_iter()
+            .map(|(name, ident)| {
+                let shard = self.chains.get(&name).unwrap_or(&*PRIMARY_SHARD).clone();
+                (name, ident, shard)
+            })
+            .collect();
+
+        let logger = self.logger.new(o!("component" => "BlockStore"));
+
+        let block_store = Arc::new(
+            DieselBlockStore::new(
+                logger,
+                networks,
+                self.pools.clone(),
+                chain_head_update_listener.clone(),
+            )
+            .expect("Creating the BlockStore works"),
+        );
+
+        Arc::new(DieselStore::new(
+            self.subgraph_store.cheap_clone(),
+            block_store,
+        ))
     }
 
     pub fn subscription_manager(&self) -> Arc<SubscriptionManager> {
@@ -209,6 +231,6 @@ impl StoreBuilder {
     #[cfg(debug_assertions)]
     #[allow(dead_code)]
     pub fn primary_pool(&self) -> ConnectionPool {
-        self.primary_pool.clone()
+        self.pools.get(&*PRIMARY_SHARD).unwrap().clone()
     }
 }

@@ -10,14 +10,18 @@ use std::time::{Duration, Instant};
 use graph::{
     data::graphql::{object, object_value},
     data::subgraph::schema::SubgraphError,
-    data::{query::CacheStatus, query::QueryTarget, subgraph::SubgraphFeature},
+    data::{
+        query::CacheStatus,
+        query::{QueryResults, QueryTarget},
+        subgraph::SubgraphFeature,
+    },
     prelude::{
         async_trait, futures03::stream::StreamExt, futures03::FutureExt, futures03::TryFutureExt,
         o, q, serde_json, slog, tokio, Entity, EntityKey, EntityOperation, EthereumBlockPointer,
         FutureExtension, GraphQlRunner as _, Logger, NodeId, Query, QueryError,
         QueryExecutionError, QueryLoadManager, QueryResult, QueryStoreManager, QueryVariables,
-        Schema, Store, SubgraphDeploymentEntity, SubgraphDeploymentId, SubgraphManifest,
-        SubgraphName, SubgraphVersionSwitchingMode, Subscription, SubscriptionError, Value,
+        Schema, SubgraphDeploymentEntity, SubgraphDeploymentId, SubgraphManifest, SubgraphName,
+        SubgraphStore, SubgraphVersionSwitchingMode, Subscription, SubscriptionError, Value,
     },
 };
 use graph_graphql::{prelude::*, subscription::execute_subscription};
@@ -39,8 +43,7 @@ fn setup_with_features(id: &str, features: BTreeSet<SubgraphFeature>) -> Subgrap
     let id = SubgraphDeploymentId::new(id).unwrap();
 
     let chain = vec![&*GENESIS_BLOCK, &*BLOCK_ONE, &*BLOCK_TWO];
-    block_store::remove();
-    block_store::insert(chain, NETWORK_NAME);
+    block_store::set_chain(chain, NETWORK_NAME);
     test_store::remove_subgraphs();
 
     let schema = test_schema(id.clone());
@@ -57,7 +60,7 @@ fn setup_with_features(id: &str, features: BTreeSet<SubgraphFeature>) -> Subgrap
         templates: vec![],
     };
 
-    insert_test_entities(STORE.as_ref(), manifest);
+    insert_test_entities(STORE.subgraph_store().as_ref(), manifest);
 
     id
 }
@@ -98,7 +101,7 @@ fn test_schema(id: SubgraphDeploymentId) -> Schema {
     .expect("Test schema invalid")
 }
 
-fn insert_test_entities(store: &impl Store, manifest: SubgraphManifest) {
+fn insert_test_entities(store: &impl SubgraphStore, manifest: SubgraphManifest) {
     let deployment = SubgraphDeploymentEntity::new(&manifest, false, None);
     let name = SubgraphName::new("test/query").unwrap();
     let node_id = NodeId::new("test").unwrap();
@@ -220,7 +223,7 @@ fn insert_test_entities(store: &impl Store, manifest: SubgraphManifest) {
         });
 
         transact_entity_operations(
-            &STORE,
+            &STORE.subgraph_store(),
             id.clone(),
             block_ptr,
             insert_ops.collect::<Vec<_>>(),
@@ -253,7 +256,21 @@ async fn execute_query_document_with_variables(
     runner
         .run_query_with_complexity(query, target, None, None, None, None, false)
         .await
-        .unwrap_first()
+        .first()
+        .unwrap()
+        .duplicate()
+}
+
+async fn first_result<F>(f: F) -> QueryResult
+where
+    F: FnOnce() -> QueryResults + Sync + Send + 'static,
+{
+    graph::spawn_blocking_allow_panic(f)
+        .await
+        .unwrap()
+        .first()
+        .unwrap()
+        .duplicate()
 }
 
 struct MockQueryLoadManager(Arc<tokio::sync::Semaphore>);
@@ -788,12 +805,10 @@ fn query_complexity() {
 
         // This query is exactly at the maximum complexity.
         let id2 = id.clone();
-        let result = graph::spawn_blocking_allow_panic(move || {
+        let result = first_result(move || {
             execute_subgraph_query_with_complexity(query, id2.into(), max_complexity)
         })
-        .await
-        .unwrap()
-        .unwrap_first();
+        .await;
         assert!(!result.has_errors());
 
         let query = Query::new(
@@ -821,12 +836,11 @@ fn query_complexity() {
         );
 
         // The extra introspection causes the complexity to go over.
-        let result = graph::spawn_blocking_allow_panic(move || {
+        let result = first_result(move || {
             execute_subgraph_query_with_complexity(query, id.into(), max_complexity)
         })
-        .await
-        .unwrap();
-        match result.unwrap_first().to_result().unwrap_err()[0] {
+        .await;
+        match result.to_result().unwrap_err()[0] {
             QueryError::ExecutionError(QueryExecutionError::TooComplex(1_010_200, _)) => (),
             _ => panic!("did not catch complexity"),
         };
@@ -837,7 +851,11 @@ fn query_complexity() {
 fn query_complexity_subscriptions() {
     run_test_sequentially(setup, |_, id| async move {
         let logger = Logger::root(slog::Discard, o!());
-        let store = STORE.clone().query_store(id.clone().into(), true).unwrap();
+        let store = STORE
+            .clone()
+            .query_store(id.clone().into(), true)
+            .await
+            .unwrap();
 
         let query = Query::new(
             graphql_parser::parse_query(
@@ -869,7 +887,7 @@ fn query_complexity_subscriptions() {
             max_skip: std::u32::MAX,
             load_manager: mock_query_load_manager(),
         };
-        let schema = STORE.api_schema(&id).unwrap();
+        let schema = STORE.subgraph_store().api_schema(&id).unwrap();
 
         // This query is exactly at the maximum complexity.
         // FIXME: Not collecting the stream because that will hang the test.
@@ -900,7 +918,11 @@ fn query_complexity_subscriptions() {
             None,
         );
 
-        let store = STORE.clone().query_store(id.clone().into(), true).unwrap();
+        let store = STORE
+            .clone()
+            .query_store(id.clone().into(), true)
+            .await
+            .unwrap();
 
         let options = SubscriptionExecutionOptions {
             logger,
@@ -936,12 +958,10 @@ fn instant_timeout() {
             None,
         );
 
-        match graph::spawn_blocking_allow_panic(move || {
+        match first_result(move || {
             execute_subgraph_query_with_deadline(query, id.into(), Some(Instant::now()))
         })
         .await
-        .unwrap()
-        .unwrap_first()
         .to_result()
         .unwrap_err()[0]
         {
@@ -1253,8 +1273,12 @@ fn cannot_filter_by_derved_relationship_fields() {
 fn subscription_gets_result_even_without_events() {
     run_test_sequentially(setup, |_, id| async move {
         let logger = Logger::root(slog::Discard, o!());
-        let store = STORE.clone().query_store(id.clone().into(), true).unwrap();
-        let schema = STORE.api_schema(&id).unwrap();
+        let store = STORE
+            .clone()
+            .query_store(id.clone().into(), true)
+            .await
+            .unwrap();
+        let schema = STORE.subgraph_store().api_schema(&id).unwrap();
 
         let query = Query::new(
             graphql_parser::parse_query(
@@ -1533,7 +1557,9 @@ fn query_detects_reorg() {
             .expect("invalid test query")
             .into_static();
         let state = STORE
+            .subgraph_store()
             .deployment_state_from_id(id.clone())
+            .await
             .expect("failed to get state");
 
         // Inject a fake initial state; c435c25decbc4ad7bbbadf8e0ced0ff2
@@ -1551,6 +1577,7 @@ fn query_detects_reorg() {
 
         // Revert one block
         STORE
+            .subgraph_store()
             .revert_block_operations(id.clone(), GENESIS_PTR.clone())
             .unwrap();
         // A query is still fine since we implicitly query at block 0; we were
@@ -1566,7 +1593,13 @@ fn query_detects_reorg() {
         // We move the subgraph head forward, which will execute the query at block 1
         // But the state we have is also for block 1, but with a smaller reorg count
         // and we therefore report an error
-        transact_entity_operations(&*STORE, id.clone(), BLOCK_ONE.clone(), vec![]).unwrap();
+        transact_entity_operations(
+            &STORE.subgraph_store(),
+            id.clone(),
+            BLOCK_ONE.clone(),
+            vec![],
+        )
+        .unwrap();
         let result = execute_query_document(&id, query.clone()).await;
         match result.to_result().unwrap_err()[0] {
             QueryError::ExecutionError(QueryExecutionError::DeploymentReverted) => { /* expected */
@@ -1732,6 +1765,7 @@ fn non_fatal_errors() {
 
             // Test error reverts.
             STORE
+                .subgraph_store()
                 .revert_block_operations(id.clone(), *BLOCK_ONE)
                 .unwrap();
             let query = "query { musician(id: \"m1\") { id }  _meta { hasIndexingErrors } }";

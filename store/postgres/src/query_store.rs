@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use web3::types::H256;
 
-use crate::store::ReplicaId;
+use crate::deployment_store::{DeploymentStore, ReplicaId};
 use graph::components::store::QueryStore as QueryStoreTrait;
 use graph::prelude::*;
 
@@ -11,13 +11,13 @@ use crate::primary::Site;
 pub(crate) struct QueryStore {
     site: Arc<Site>,
     replica_id: ReplicaId,
-    store: Arc<crate::Store>,
+    store: Arc<DeploymentStore>,
     chain_store: Arc<crate::ChainStore>,
 }
 
 impl QueryStore {
     pub(crate) fn new(
-        store: Arc<crate::Store>,
+        store: Arc<DeploymentStore>,
         chain_store: Arc<crate::ChainStore>,
         site: Arc<Site>,
         replica_id: ReplicaId,
@@ -67,20 +67,17 @@ impl QueryStoreTrait for QueryStore {
         // available. Ideally, we'd have the last REORG_THRESHOLD blocks in
         // memory so that we can check against them, and then mark in the
         // database the blocks on the main chain that we consider final
-        let subgraph_network = self.network_name()?;
+        let subgraph_network = self.network_name();
         self.chain_store
             .block_number(block_hash)?
             .map(|(network_name, number)| {
-                if subgraph_network.is_none() || Some(&network_name) == subgraph_network.as_ref() {
+                if &network_name == subgraph_network {
                     BlockNumber::try_from(number)
                         .map_err(|e| StoreError::QueryExecutionError(e.to_string()))
                 } else {
                     Err(StoreError::QueryExecutionError(format!(
                         "subgraph {} belongs to network {} but block {:x} belongs to network {}",
-                        &self.site.deployment,
-                        subgraph_network.unwrap_or("(none)".to_owned()),
-                        block_hash,
-                        network_name
+                        &self.site.deployment, subgraph_network, block_hash, network_name
                     )))
                 }
             })
@@ -103,10 +100,11 @@ impl QueryStoreTrait for QueryStore {
             .await
     }
 
-    fn deployment_state(&self) -> Result<DeploymentState, QueryExecutionError> {
+    async fn deployment_state(&self) -> Result<DeploymentState, QueryExecutionError> {
         Ok(self
             .store
-            .deployment_state_from_id(self.site.deployment.clone())?)
+            .deployment_state_from_id(self.site.deployment.clone())
+            .await?)
     }
 
     fn api_schema(&self) -> Result<Arc<ApiSchema>, QueryExecutionError> {
@@ -114,8 +112,7 @@ impl QueryStoreTrait for QueryStore {
         Ok(info.api)
     }
 
-    fn network_name(&self) -> Result<Option<String>, QueryExecutionError> {
-        let info = self.store.subgraph_info(&self.site.deployment)?;
-        Ok(info.network)
+    fn network_name(&self) -> &str {
+        &self.site.network
     }
 }

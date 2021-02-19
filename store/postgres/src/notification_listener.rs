@@ -28,6 +28,7 @@ lazy_static! {
             .unwrap_or(Duration::from_secs(300));
 }
 
+#[derive(Clone)]
 /// This newtype exists to make it hard to misuse the `NotificationListener` API in a way that
 /// could impact security.
 pub struct SafeChannelName(String);
@@ -44,6 +45,10 @@ impl SafeChannelName {
     /// by an attacker.
     pub fn i_promise_this_is_safe(channel_name: impl Into<String>) -> Self {
         SafeChannelName(channel_name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -209,6 +214,16 @@ impl EventProducer<JsonNotification> for NotificationListener {
     }
 }
 
+mod public {
+    table! {
+        large_notifications(id) {
+            id -> Integer,
+            payload -> Text,
+            created_at -> Timestamp,
+        }
+    }
+}
+
 // A utility to send JSON notifications that may be larger than the
 // 8000 bytes limit for Postgres NOTIFY payloads. Large notifications
 // are written to the `large_notifications` table and their ID is sent
@@ -286,9 +301,9 @@ impl JsonNotification {
         data: &serde_json::Value,
         conn: &PgConnection,
     ) -> Result<(), StoreError> {
-        use crate::db_schema::large_notifications::dsl::*;
         use diesel::ExpressionMethods;
         use diesel::RunQueryDsl;
+        use public::large_notifications::dsl::*;
 
         let msg = data.to_string();
 

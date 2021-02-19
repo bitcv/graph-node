@@ -1,7 +1,13 @@
-use diesel::Connection;
-use std::fmt;
+use diesel::{
+    pg::Pg,
+    serialize::Output,
+    sql_types::Text,
+    types::{FromSql, ToSql},
+};
+use std::iter::FromIterator;
 use std::sync::RwLock;
 use std::{collections::BTreeMap, collections::HashMap, sync::Arc};
+use std::{fmt, io::Write};
 
 use graph::{
     components::{
@@ -16,24 +22,24 @@ use graph::{
     prelude::StoreEvent,
     prelude::SubgraphDeploymentEntity,
     prelude::{
-        lazy_static, web3::types::Address, ApiSchema, DeploymentState, DynTryFuture, Entity,
-        EntityKey, EntityModification, EntityQuery, Error, EthereumBlockPointer, EthereumCallCache,
-        Logger, MetadataOperation, NodeId, QueryExecutionError, Schema, StopwatchMetrics,
-        Store as StoreTrait, StoreError, SubgraphDeploymentId, SubgraphName,
+        lazy_static, o, web3::types::Address, ApiSchema, CheapClone, DeploymentState, DynTryFuture,
+        Entity, EntityKey, EntityModification, EntityQuery, Error, EthereumBlockPointer, Logger,
+        MetadataOperation, MetricsRegistry, NodeId, QueryExecutionError, Schema, StopwatchMetrics,
+        StoreError, SubgraphDeploymentId, SubgraphName, SubgraphStore as SubgraphStoreTrait,
         SubgraphVersionSwitchingMode,
     },
 };
 use store::StoredDynamicDataSource;
 
-use crate::{deployment, primary, primary::Site};
+use crate::{connection_pool::ConnectionPool, primary, primary::Site};
 use crate::{
+    deployment_store::{DeploymentStore, ReplicaId},
     detail::DeploymentDetail,
     primary::UnusedDeployment,
-    store::{ReplicaId, Store},
 };
 
 /// The name of a database shard; valid names must match `[a-z0-9_]+`
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, AsExpression, FromSqlRow)]
 pub struct Shard(String);
 
 lazy_static! {
@@ -77,6 +83,19 @@ impl fmt::Display for Shard {
     }
 }
 
+impl FromSql<Text, Pg> for Shard {
+    fn from_sql(bytes: Option<&[u8]>) -> diesel::deserialize::Result<Self> {
+        let s = <String as FromSql<Text, Pg>>::from_sql(bytes)?;
+        Shard::new(s).map_err(Into::into)
+    }
+}
+
+impl ToSql<Text, Pg> for Shard {
+    fn to_sql<W: Write>(&self, out: &mut Output<W, Pg>) -> diesel::serialize::Result {
+        <String as ToSql<Text, Pg>>::to_sql(&self.0, out)
+    }
+}
+
 /// Decide where a new deployment should be placed based on the subgraph name
 /// and the network it is indexing. If the deployment can be placed, returns
 /// the name of the database shard for the deployment and the names of the
@@ -96,28 +115,111 @@ pub mod unused {
     }
 }
 
-/// Multiplex store operations on subgraphs and deployments between a primary
-/// and any number of additional storage shards. See [this document](../../docs/sharded.md)
-/// for details on how storage is split up
-pub struct ShardedStore {
-    primary: Arc<Store>,
-    stores: HashMap<Shard, Arc<Store>>,
+/// Multiplex store operations on subgraphs and deployments between a
+/// primary and any number of additional storage shards. The primary
+/// contains information about named subgraphs, and how the underlying
+/// deployments are spread across shards, while the actual deployment data
+/// and metadata is stored in the shards.  Depending on the configuration,
+/// the database for the primary and for the shards can be the same
+/// database, in which case they are all backed by one connection pool, or
+/// separate databases in the same Postgres cluster, or entirely separate
+/// clusters. Details of how to configure shards can be found in [this
+/// document](https://github.com/graphprotocol/graph-node/blob/master/docs/sharding.md)
+///
+/// The primary uses the following database tables:
+/// - `public.deployment_schemas`: immutable data about deployments, including
+///   the shard that stores the deployment data and metadata, the namespace in
+///   the shard that contains the deployment data, and the network/chain that
+///   the  deployment is indexing
+/// - `subgraphs.subgraph` and `subgraphs.subgraph_version`: information about
+///   named subgraphs and how they map to deployments
+/// - `subgraphs.subgraph_deployment_assignment`: which index node is indexing
+///   what deployment
+///
+/// For each deployment, the corresponding shard contains a namespace for
+/// the deployment data; the schema in that namespace is generated from the
+/// deployment's GraphQL schema by the [crate::relational::Layout], which
+/// is also responsible for modifying and querying subgraph
+/// data. Deployment metadata is stored in tables in the `subgraphs`
+/// namespace in the same shard as the deployment data. The most important
+/// of these tables are
+///
+/// - `subgraphs.subgraph_deployment`: the main table for deployment metadata;
+///   most importantly, it stores the pointer to the current subgraph head, i.e.,
+///   the block up to which the subgraph has indexed the chain, together with
+///   other things like whether the subgraph has synced, whether it has failed
+///   and whether it encountered any errors
+/// - `subgraphs.subgraph_manifest`: immutable information derived from the YAML
+///   manifest for the deployment
+/// - `subgraphs.dynamic_ethereum_contract_data_source`: the data sources that
+///   the subgraph has created from templates in the manifest. Some detail about
+///   dynamic data sources is also stored in `subgraphs.ethereum_contract_source`
+/// - `subgraphs.subgraph_error`: details about errors that the deployment has
+///   encountered
+///
+/// There are more metadata tables, but they are rarely if ever read, only
+/// written to when a deployment is created and should be removed in a
+/// future version of `graph-node`
+///
+/// The `SubgraphStore` mostly orchestrates access to the primary and the
+/// shards.  The actual work is done by code in the `primary` module for
+/// queries against the primary store, and by the `DeploymentStore` for
+/// access to deployment data and metadata.
+pub struct SubgraphStore {
+    logger: Logger,
+    primary: ConnectionPool,
+    stores: HashMap<Shard, Arc<DeploymentStore>>,
     /// Cache for the mapping from deployment id to shard/namespace/id
     sites: RwLock<HashMap<SubgraphDeploymentId, Arc<Site>>>,
     placer: Arc<dyn DeploymentPlacer + Send + Sync + 'static>,
 }
 
-impl ShardedStore {
+impl SubgraphStore {
+    /// Create a new store for subgraphs that distributes deployments across
+    /// multiple databases
+    ///
+    /// `stores` is a list of the shards. The tuple contains the shard name, the main
+    /// connection pool for the database, a list of read-only connections
+    /// for the same database, and a list of weights determining how often
+    /// to use the main pool and the read replicas for queries. The list
+    /// of weights must be one longer than the list of read replicas, and
+    /// `weights[0]` is used for the main pool.
+    ///
+    /// All write operations for a shard are performed against the main
+    /// pool. One of the shards must be named `primary`
+    ///
+    /// The `placer` determines where `create_subgraph_deployment` puts a new deployment
     pub fn new(
-        stores: HashMap<Shard, Arc<Store>>,
+        logger: &Logger,
+        stores: Vec<(Shard, ConnectionPool, Vec<ConnectionPool>, Vec<usize>)>,
         placer: Arc<dyn DeploymentPlacer + Send + Sync + 'static>,
+        registry: Arc<dyn MetricsRegistry>,
     ) -> Self {
         let primary = stores
-            .get(&PRIMARY_SHARD)
-            .expect("we always have a primary store")
-            .clone();
+            .iter()
+            .find(|(name, _, _, _)| name == &*PRIMARY_SHARD)
+            .map(|(_, pool, _, _)| pool.clone())
+            .expect("we always have a primary shard");
+        let stores = HashMap::from_iter(stores.into_iter().map(
+            |(name, main_pool, read_only_pools, weights)| {
+                let logger = logger.new(o!("shard" => name.to_string()));
+
+                (
+                    name,
+                    Arc::new(DeploymentStore::new(
+                        &logger,
+                        main_pool,
+                        read_only_pools,
+                        weights,
+                        registry.cheap_clone(),
+                    )),
+                )
+            },
+        ));
         let sites = RwLock::new(HashMap::new());
+        let logger = logger.new(o!("shard" => PRIMARY_SHARD.to_string()));
         Self {
+            logger,
             primary,
             stores,
             sites,
@@ -160,7 +262,10 @@ impl ShardedStore {
         Ok(())
     }
 
-    fn store(&self, id: &SubgraphDeploymentId) -> Result<(&Arc<Store>, Arc<Site>), StoreError> {
+    fn store(
+        &self,
+        id: &SubgraphDeploymentId,
+    ) -> Result<(&Arc<DeploymentStore>, Arc<Site>), StoreError> {
         let site = self.site(id)?;
         let store = self
             .stores
@@ -224,7 +329,7 @@ impl ShardedStore {
         // TODO: Check this for behavior on failure
         let site = self
             .primary_conn()?
-            .allocate_site(shard.clone(), &schema.id, &network_name)?;
+            .allocate_site(shard.clone(), &schema.id, network_name)?;
 
         let graft_site = deployment
             .graft_base
@@ -248,8 +353,7 @@ impl ShardedStore {
 
         let exists_and_synced = |id: &SubgraphDeploymentId| {
             let (store, _) = self.store(id)?;
-            let conn = store.get_conn()?;
-            deployment::exists_and_synced(&conn, id.as_str())
+            store.deployment_exists_and_synced(id)
         };
 
         // FIXME: This simultaneously holds a `primary_conn` and a shard connection, which can
@@ -290,16 +394,31 @@ impl ShardedStore {
         conn.send_store_event(event)
     }
 
+    /// Get a connection to the primary shard. Code must never hold one of these
+    /// connections while also accessing a `DeploymentStore`, since both
+    /// might draw connections from the same pool, and trying to get two
+    /// connections can deadlock the entire process if the pool runs out
+    /// of connections in between getting the first one and trying to get the
+    /// second one.
     fn primary_conn(&self) -> Result<primary::Connection, StoreError> {
-        let conn = self.primary.get_conn()?;
+        let conn = self.primary.get_with_timeout_warning(&self.logger)?;
         Ok(primary::Connection::new(conn))
+    }
+
+    pub(crate) async fn with_primary_conn<T: Send + 'static>(
+        &self,
+        f: impl 'static + Send + FnOnce(primary::Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.primary
+            .with_conn(|conn, _| f(primary::Connection::new(conn)).map_err(|e| e.into()))
+            .await
     }
 
     pub(crate) fn replica_for_query(
         &self,
         target: QueryTarget,
         for_subscription: bool,
-    ) -> Result<(Arc<Store>, Arc<Site>, ReplicaId), StoreError> {
+    ) -> Result<(Arc<DeploymentStore>, Arc<Site>, ReplicaId), StoreError> {
         let id = match target {
             QueryTarget::Name(name) => {
                 let conn = self.primary_conn()?;
@@ -319,42 +438,17 @@ impl ShardedStore {
     /// it very hard to export items just for testing
     #[cfg(debug_assertions)]
     pub fn delete_all_entities_for_test_use_only(&self) -> Result<(), StoreError> {
-        use diesel::connection::SimpleConnection;
-
         let pconn = self.primary_conn()?;
         let schemas = pconn.sites()?;
 
         // Delete all subgraph schemas
         for schema in schemas {
             let (store, _) = self.store(&schema.deployment)?;
-            let conn = store.get_conn()?;
-            deployment::drop_schema(&conn, &schema.namespace)?;
+            store.drop_deployment_schema(&schema.namespace)?;
         }
 
-        // Delete metadata entities in each shard
-        // Generated by running 'layout -g delete subgraphs.graphql'
-        let query = "
-        delete from subgraphs.ethereum_block_handler_filter_entity;
-        delete from subgraphs.ethereum_contract_source;
-        delete from subgraphs.dynamic_ethereum_contract_data_source;
-        delete from subgraphs.ethereum_contract_abi;
-        delete from subgraphs.subgraph;
-        delete from subgraphs.subgraph_deployment;
-        delete from subgraphs.ethereum_block_handler_entity;
-        delete from subgraphs.subgraph_deployment_assignment;
-        delete from subgraphs.ethereum_contract_mapping;
-        delete from subgraphs.subgraph_version;
-        delete from subgraphs.subgraph_manifest;
-        delete from subgraphs.ethereum_call_handler_entity;
-        delete from subgraphs.ethereum_contract_data_source;
-        delete from subgraphs.ethereum_contract_data_source_template;
-        delete from subgraphs.ethereum_contract_data_source_template_source;
-        delete from subgraphs.ethereum_contract_event_handler;
-    ";
         for store in self.stores.values() {
-            let conn = store.get_conn()?;
-            conn.batch_execute(query)?;
-            conn.batch_execute("delete from deployment_schemas;")?;
+            store.drop_all_metadata()?;
         }
         self.clear_caches();
         Ok(())
@@ -472,6 +566,87 @@ impl ShardedStore {
         Ok(())
     }
 
+    pub(crate) fn status(&self, filter: status::Filter) -> Result<Vec<status::Info>, StoreError> {
+        let deployments = match filter {
+            status::Filter::SubgraphName(name) => {
+                let deployments = self.primary_conn()?.deployments_for_subgraph(name)?;
+                if deployments.is_empty() {
+                    return Ok(Vec::new());
+                }
+                deployments
+            }
+            status::Filter::SubgraphVersion(name, use_current) => {
+                let deployment = self.primary_conn()?.subgraph_version(name, use_current)?;
+                match deployment {
+                    Some(deployment) => vec![deployment],
+                    None => {
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+            status::Filter::Deployments(deployments) => deployments,
+        };
+
+        let by_shard: HashMap<Shard, Vec<Arc<Site>>> = self.deployments_by_shard(deployments)?;
+
+        // Go shard-by-shard to look up deployment statuses
+        let mut infos = Vec::new();
+        for (shard, sites) in by_shard.into_iter() {
+            let store = self
+                .stores
+                .get(&shard)
+                .ok_or(StoreError::UnknownShard(shard.to_string()))?;
+            infos.extend(store.deployment_statuses(&sites)?);
+        }
+        let infos = self.primary_conn()?.fill_assignments(infos)?;
+        Ok(infos)
+    }
+
+    pub(crate) fn version_info(&self, version: &str) -> Result<VersionInfo, StoreError> {
+        if let Some((deployment_id, created_at)) = self.primary_conn()?.version_info(version)? {
+            let id = SubgraphDeploymentId::new(deployment_id.clone())
+                .map_err(|id| constraint_violation!("illegal deployment id {}", id))?;
+            let (store, site) = self.store(&id)?;
+            let statuses = store.deployment_statuses(&vec![site])?;
+            let status = statuses
+                .first()
+                .ok_or_else(|| StoreError::DeploymentNotFound(deployment_id.clone()))?;
+            let chain = status
+                .chains
+                .first()
+                .ok_or_else(|| constraint_violation!("no chain info for {}", deployment_id))?;
+            let latest_ethereum_block_number =
+                chain.latest_block.as_ref().map(|ref block| block.number());
+            let subgraph_info = store.subgraph_info(&id)?;
+            let network = self.network_name(&id)?;
+
+            let info = VersionInfo {
+                created_at,
+                deployment_id,
+                latest_ethereum_block_number,
+                total_ethereum_blocks_count: None,
+                synced: status.synced,
+                failed: status.health.is_failed(),
+                description: subgraph_info.description,
+                repository: subgraph_info.repository,
+                schema: subgraph_info.input,
+                network: network.to_string(),
+            };
+            Ok(info)
+        } else {
+            Err(StoreError::DeploymentNotFound(version.to_string()))
+        }
+    }
+
+    pub(crate) fn versions_for_subgraph_id(
+        &self,
+        subgraph_id: &str,
+    ) -> Result<(Option<String>, Option<String>), StoreError> {
+        let primary = self.primary_conn()?;
+
+        primary.versions_for_subgraph_id(subgraph_id)
+    }
+
     #[cfg(debug_assertions)]
     pub fn error_count(&self, id: &SubgraphDeploymentId) -> Result<usize, StoreError> {
         let (store, _) = self.store(id)?;
@@ -480,7 +655,7 @@ impl ShardedStore {
 }
 
 #[async_trait::async_trait]
-impl StoreTrait for ShardedStore {
+impl SubgraphStoreTrait for SubgraphStore {
     fn block_ptr(&self, id: &SubgraphDeploymentId) -> Result<Option<EthereumBlockPointer>, Error> {
         let (store, site) = self.store(id)?;
         store.block_ptr(site.as_ref())
@@ -529,7 +704,7 @@ impl StoreTrait for ShardedStore {
     }
 
     fn find_ens_name(&self, hash: &str) -> Result<Option<String>, QueryExecutionError> {
-        self.primary.find_ens_name(hash)
+        Ok(self.primary_conn()?.find_ens_name(hash)?)
     }
 
     fn transact_block_operations(
@@ -565,20 +740,22 @@ impl StoreTrait for ShardedStore {
         self.send_store_event(&event)
     }
 
-    fn deployment_state_from_name(
+    async fn deployment_state_from_name(
         &self,
         name: SubgraphName,
     ) -> Result<DeploymentState, StoreError> {
-        let id = self.primary_conn()?.current_deployment_for_subgraph(name)?;
-        self.deployment_state_from_id(id)
+        let id = self
+            .with_primary_conn(|conn| conn.current_deployment_for_subgraph(name))
+            .await?;
+        self.deployment_state_from_id(id).await
     }
 
-    fn deployment_state_from_id(
+    async fn deployment_state_from_id(
         &self,
         id: SubgraphDeploymentId,
     ) -> Result<DeploymentState, StoreError> {
         let (store, _) = self.store(&id)?;
-        store.deployment_state_from_id(id)
+        store.deployment_state_from_id(id).await
     }
 
     fn start_subgraph_deployment(
@@ -598,6 +775,11 @@ impl StoreTrait for ShardedStore {
         store.start_subgraph(logger, site, graft_base)
     }
 
+    fn unfail(&self, id: &SubgraphDeploymentId) -> Result<(), StoreError> {
+        let (store, site) = self.store(id)?;
+        store.unfail(site)
+    }
+
     fn is_deployment_synced(&self, id: &SubgraphDeploymentId) -> Result<bool, Error> {
         let (store, _) = self.store(&id)?;
         Ok(store.exists_and_synced(&id)?)
@@ -605,6 +787,9 @@ impl StoreTrait for ShardedStore {
 
     fn deployment_synced(&self, id: &SubgraphDeploymentId) -> Result<(), Error> {
         let event = {
+            // Make sure we drop `pconn` before we call into the deployment
+            // store so that we do not hold two database connections which
+            // might come from the same pool and could therefore deadlock
             let pconn = self.primary_conn()?;
             pconn.transaction(|| -> Result<_, Error> {
                 let changes = pconn.promote_deployment(id)?;
@@ -613,11 +798,8 @@ impl StoreTrait for ShardedStore {
         };
 
         let (dstore, _) = self.store(id)?;
-        {
-            // Do not hold dconn and primary_conn() at the same time.
-            let dconn = dstore.get_conn()?;
-            dconn.transaction(|| deployment::set_synced(&dconn, id))?;
-        }
+        dstore.deployment_synced(id)?;
+
         Ok(self.primary_conn()?.send_store_event(&event)?)
     }
 
@@ -675,47 +857,6 @@ impl StoreTrait for ShardedStore {
         })
     }
 
-    fn status(&self, filter: status::Filter) -> Result<Vec<status::Info>, StoreError> {
-        let deployments = match filter {
-            status::Filter::SubgraphName(name) => {
-                let deployments = self.primary_conn()?.deployments_for_subgraph(name)?;
-                if deployments.is_empty() {
-                    return Ok(Vec::new());
-                }
-                deployments
-            }
-            status::Filter::SubgraphVersion(name, use_current) => {
-                let deployment = self.primary_conn()?.subgraph_version(name, use_current)?;
-                match deployment {
-                    Some(deployment) => vec![deployment],
-                    None => {
-                        return Ok(Vec::new());
-                    }
-                }
-            }
-            status::Filter::Deployments(deployments) => deployments,
-        };
-
-        let by_shard: HashMap<Shard, Vec<Arc<Site>>> = self.deployments_by_shard(deployments)?;
-
-        // Go shard-by-shard to look up deployment statuses
-        let mut infos = Vec::new();
-        for (shard, ids) in by_shard.into_iter() {
-            let store = self
-                .stores
-                .get(&shard)
-                .ok_or(StoreError::UnknownShard(shard.to_string()))?;
-            let ids = ids
-                .into_iter()
-                .map(|site| site.deployment.to_string())
-                .collect();
-            infos.extend(store.deployment_statuses(ids)?);
-        }
-        let infos = self.primary_conn()?.fill_assignments(infos)?;
-        let infos = self.primary_conn()?.fill_chain_head_pointers(infos)?;
-        Ok(infos)
-    }
-
     async fn load_dynamic_data_sources(
         &self,
         id: SubgraphDeploymentId,
@@ -760,82 +901,9 @@ impl StoreTrait for ShardedStore {
         Ok(info.api)
     }
 
-    fn network_name(&self, id: &SubgraphDeploymentId) -> Result<Option<String>, StoreError> {
-        let (store, _) = self.store(&id)?;
-        let info = store.subgraph_info(id)?;
-        Ok(info.network)
-    }
-
-    fn version_info(&self, version: &str) -> Result<VersionInfo, StoreError> {
-        if let Some((deployment_id, created_at)) = self.primary_conn()?.version_info(version)? {
-            let id = SubgraphDeploymentId::new(deployment_id.clone())
-                .map_err(|id| constraint_violation!("illegal deployment id {}", id))?;
-            let (store, _) = self.store(&id)?;
-            let statuses = store.deployment_statuses(vec![deployment_id.clone()])?;
-            let status = statuses
-                .first()
-                .ok_or_else(|| StoreError::DeploymentNotFound(deployment_id.clone()))?;
-            let chain = status
-                .chains
-                .first()
-                .ok_or_else(|| constraint_violation!("no chain info for {}", deployment_id))?;
-            let latest_ethereum_block_number =
-                chain.latest_block.as_ref().map(|ref block| block.number());
-            let subgraph_info = store.subgraph_info(&id)?;
-            let total_ethereum_blocks_count = subgraph_info
-                .network
-                .as_ref()
-                .map(|network| self.primary_conn()?.chain_head_block(network))
-                .transpose()?
-                .flatten();
-
-            let info = VersionInfo {
-                created_at,
-                deployment_id,
-                latest_ethereum_block_number,
-                total_ethereum_blocks_count,
-                synced: status.synced,
-                failed: status.health.is_failed(),
-                description: subgraph_info.description,
-                repository: subgraph_info.repository,
-                schema: subgraph_info.input,
-                network: subgraph_info.network,
-            };
-            Ok(info)
-        } else {
-            Err(StoreError::DeploymentNotFound(version.to_string()))
-        }
-    }
-
-    fn versions_for_subgraph_id(
-        &self,
-        subgraph_id: &str,
-    ) -> Result<(Option<String>, Option<String>), StoreError> {
-        let primary = self.primary_conn()?;
-
-        primary.versions_for_subgraph_id(subgraph_id)
-    }
-}
-
-impl EthereumCallCache for ShardedStore {
-    fn get_call(
-        &self,
-        contract_address: Address,
-        encoded_call: &[u8],
-        block: EthereumBlockPointer,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        self.primary.get_call(contract_address, encoded_call, block)
-    }
-
-    fn set_call(
-        &self,
-        contract_address: Address,
-        encoded_call: &[u8],
-        block: EthereumBlockPointer,
-        return_value: &[u8],
-    ) -> Result<(), Error> {
-        self.primary
-            .set_call(contract_address, encoded_call, block, return_value)
+    fn network_name(&self, id: &SubgraphDeploymentId) -> Result<String, StoreError> {
+        let (_, site) = self.store(&id)?;
+        Ok(site.network.to_string())
     }
 }
 

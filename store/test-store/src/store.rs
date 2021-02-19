@@ -4,7 +4,7 @@ use graph::data::query::QueryResults;
 use graph::data::query::QueryTarget;
 use graph::data::subgraph::schema::SubgraphError;
 use graph::log;
-use graph::prelude::{QueryStoreManager as _, Store as _, *};
+use graph::prelude::{QueryStoreManager as _, SubgraphStore as _, *};
 use graph::{components::store::EntityType, prelude::NodeId};
 use graph_graphql::prelude::{
     execute_query, Query as PreparedQuery, QueryExecutionOptions, StoreResolver,
@@ -12,8 +12,11 @@ use graph_graphql::prelude::{
 use graph_mock::MockMetricsRegistry;
 use graph_node::config::{Config, Opt};
 use graph_node::store_builder::StoreBuilder;
+use graph_store_postgres::layout_for_tests::FAKE_NETWORK_SHARED;
 use graph_store_postgres::{connection_pool::ConnectionPool, Shard, SubscriptionManager};
-use graph_store_postgres::{DeploymentPlacer, NetworkStore};
+use graph_store_postgres::{
+    BlockStore as DieselBlcokStore, DeploymentPlacer, Store, SubgraphStore as DieselSubgraphStore,
+};
 use hex_literal::hex;
 use lazy_static::lazy_static;
 use std::sync::Mutex;
@@ -45,16 +48,15 @@ lazy_static! {
         Arc::new(MockMetricsRegistry::new()),
         CONN_POOL_SIZE as usize
     ));
-    static ref STORE_POOL_CONFIG: (
-        Arc<NetworkStore>,
-        ConnectionPool,
-        Config,
-        Arc<SubscriptionManager>
-    ) = build_store();
+    static ref STORE_POOL_CONFIG: (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager>) =
+        build_store();
     pub(crate) static ref PRIMARY_POOL: ConnectionPool = STORE_POOL_CONFIG.1.clone();
-    pub static ref STORE: Arc<NetworkStore> = STORE_POOL_CONFIG.0.clone();
+    pub static ref STORE: Arc<Store> = STORE_POOL_CONFIG.0.clone();
     static ref CONFIG: Config = STORE_POOL_CONFIG.2.clone();
     pub static ref SUBSCRIPTION_MANAGER: Arc<SubscriptionManager> = STORE_POOL_CONFIG.3.clone();
+    static ref NODE_ID: NodeId = NodeId::new("test").unwrap();
+    static ref SUBGRAPH_STORE: Arc<DieselSubgraphStore> = STORE.subgraph_store();
+    static ref BLOCK_STORE: Arc<DieselBlcokStore> = STORE.block_store();
     pub static ref GENESIS_PTR: EthereumBlockPointer = (
         H256::from(hex!(
             "bd34884280958002c51d3f7b5f853e6febeba33de0f40d15b0363006533c924f"
@@ -95,7 +97,7 @@ lazy_static! {
 pub fn run_test_sequentially<R, S, F, G>(setup: G, test: F)
 where
     G: FnOnce() -> S + Send + 'static,
-    F: FnOnce(Arc<NetworkStore>, S) -> R + Send + 'static,
+    F: FnOnce(Arc<Store>, S) -> R + Send + 'static,
     R: std::future::Future<Output = ()> + Send + 'static,
 {
     let store = STORE.clone();
@@ -130,7 +132,7 @@ where
 }
 
 pub fn remove_subgraphs() {
-    STORE
+    SUBGRAPH_STORE
         .delete_all_entities_for_test_use_only()
         .expect("deleting test entities succeeds");
 }
@@ -165,16 +167,15 @@ fn create_subgraph(
         name.truncate(32);
         SubgraphName::new(name).unwrap()
     };
-    let node_id = NodeId::new("test").unwrap();
-    STORE.create_deployment_replace(
+    SUBGRAPH_STORE.create_deployment_replace(
         name,
         &schema,
         deployment,
-        node_id,
+        NODE_ID.clone(),
         NETWORK_NAME.to_string(),
         SubgraphVersionSwitchingMode::Instant,
     )?;
-    STORE.start_subgraph_deployment(&*LOGGER, &subgraph_id)
+    SUBGRAPH_STORE.start_subgraph_deployment(&*LOGGER, &subgraph_id)
 }
 
 pub fn create_test_subgraph(subgraph_id: &SubgraphDeploymentId, schema: &str) {
@@ -187,8 +188,8 @@ pub fn remove_subgraph(id: &SubgraphDeploymentId) {
         name.truncate(32);
         SubgraphName::new(name).unwrap()
     };
-    STORE.remove_subgraph(name).unwrap();
-    STORE.store().remove_deployment(id).unwrap();
+    SUBGRAPH_STORE.remove_subgraph(name).unwrap();
+    SUBGRAPH_STORE.remove_deployment(id).unwrap();
 }
 
 pub fn create_grafted_subgraph(
@@ -202,7 +203,7 @@ pub fn create_grafted_subgraph(
 }
 
 pub fn transact_errors(
-    store: &Arc<NetworkStore>,
+    store: &Arc<Store>,
     subgraph_id: SubgraphDeploymentId,
     block_ptr_to: EthereumBlockPointer,
     errs: Vec<SubgraphError>,
@@ -213,7 +214,7 @@ pub fn transact_errors(
         subgraph_id.clone(),
         metrics_registry.clone(),
     );
-    store.transact_block_operations(
+    store.subgraph_store().transact_block_operations(
         subgraph_id,
         block_ptr_to,
         Vec::new(),
@@ -224,7 +225,7 @@ pub fn transact_errors(
 
 /// Convenience to transact EntityOperation instead of EntityModification
 pub fn transact_entity_operations(
-    store: &Arc<NetworkStore>,
+    store: &Arc<DieselSubgraphStore>,
     subgraph_id: SubgraphDeploymentId,
     block_ptr_to: EthereumBlockPointer,
     ops: Vec<EntityOperation>,
@@ -253,14 +254,9 @@ pub fn transact_entity_operations(
 pub fn insert_ens_name(hash: &str, name: &str) {
     use diesel::insert_into;
     use diesel::prelude::*;
-    let conn = PRIMARY_POOL.get().unwrap();
+    use graph_store_postgres::command_support::catalog::ens_names;
 
-    table! {
-        ens_names(hash) {
-            hash -> Varchar,
-            name -> Varchar,
-        }
-    }
+    let conn = PRIMARY_POOL.get().unwrap();
 
     insert_into(ens_names::table)
         .values((ens_names::hash.eq(hash), ens_names::name.eq(name)))
@@ -285,7 +281,7 @@ pub fn insert_entities(
         });
 
     transact_entity_operations(
-        &STORE,
+        &*SUBGRAPH_STORE,
         subgraph_id.clone(),
         GENESIS_PTR.clone(),
         insert_ops.collect::<Vec<_>>(),
@@ -362,8 +358,8 @@ fn execute_subgraph_query_internal(
         QueryTarget::Deployment(id) => id,
         _ => unreachable!("tests do not use this"),
     };
-    let schema = STORE.api_schema(&id).unwrap();
-    let network = STORE.network_name(&id).unwrap();
+    let schema = SUBGRAPH_STORE.api_schema(&id).unwrap();
+    let network = Some(SUBGRAPH_STORE.network_name(&id).unwrap());
     let query = return_err!(PreparedQuery::new(
         &logger,
         schema,
@@ -374,7 +370,9 @@ fn execute_subgraph_query_internal(
     ));
     let mut result = QueryResults::empty();
     let deployment = query.schema.id().clone();
-    let store = STORE.clone().query_store(deployment.into(), false).unwrap();
+    let store = rt
+        .block_on(STORE.clone().query_store(deployment.into(), false))
+        .unwrap();
     for (bc, (selection_set, error_policy)) in return_err!(query.block_constraint()) {
         let logger = logger.clone();
         let resolver = return_err!(rt.block_on(StoreResolver::at_block(
@@ -402,12 +400,7 @@ fn execute_subgraph_query_internal(
     result
 }
 
-fn build_store() -> (
-    Arc<NetworkStore>,
-    ConnectionPool,
-    Config,
-    Arc<SubscriptionManager>,
-) {
+fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager>) {
     let mut opt = Opt::default();
     let url = std::env::var_os("THEGRAPH_STORE_POSTGRES_DIESEL_URL").filter(|s| s.len() > 0);
     let file = std::env::var_os("GRAPH_NODE_TEST_CONFIG").filter(|s| s.len() > 0);
@@ -429,17 +422,23 @@ fn build_store() -> (
     let registry = Arc::new(MockMetricsRegistry::new());
     std::thread::spawn(move || {
         STORE_RUNTIME.lock().unwrap().block_on(async {
-            let builder = StoreBuilder::new(&*LOGGER, &config, registry);
-            let net_identifiers = EthereumNetworkIdentifier {
+            let builder = StoreBuilder::new(&*LOGGER, &*NODE_ID, &config, registry);
+            let subscription_manager = builder.subscription_manager();
+            let primary_pool = builder.primary_pool();
+
+            let ident = EthereumNetworkIdentifier {
                 net_version: NETWORK_VERSION.to_owned(),
                 genesis_block_hash: GENESIS_PTR.hash,
             };
 
             (
-                builder.network_store(NETWORK_NAME.to_string(), net_identifiers),
-                builder.primary_pool(),
+                builder.network_store(vec![
+                    (NETWORK_NAME.to_string(), ident.clone()),
+                    (FAKE_NETWORK_SHARED.to_string(), ident),
+                ]),
+                primary_pool,
                 config,
-                builder.subscription_manager(),
+                subscription_manager,
             )
         })
     })
@@ -447,7 +446,7 @@ fn build_store() -> (
     .unwrap()
 }
 
-pub fn primary_connection() -> graph_store_postgres::layout_for_tests::Connection {
+pub fn primary_connection() -> graph_store_postgres::layout_for_tests::Connection<'static> {
     let conn = PRIMARY_POOL.get().unwrap();
     graph_store_postgres::layout_for_tests::Connection::new(conn)
 }

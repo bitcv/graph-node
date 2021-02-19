@@ -4,7 +4,10 @@
 use diesel::{
     data_types::PgTimestamp,
     dsl::{any, exists, not},
+    pg::Pg,
+    serialize::Output,
     sql_types::{Array, Text},
+    types::{FromSql, ToSql},
 };
 use diesel::{
     dsl::{delete, insert_into, sql, update},
@@ -22,7 +25,6 @@ use graph::{
     constraint_violation,
     data::subgraph::schema::MetadataType,
     data::subgraph::status,
-    prelude::EthereumBlockPointer,
     prelude::{
         anyhow, bigdecimal::ToPrimitive, entity, lazy_static, serde_json, EntityChange,
         EntityChangeOperation, MetadataOperation, NodeId, StoreError, SubgraphDeploymentId,
@@ -30,12 +32,13 @@ use graph::{
     },
 };
 use graph::{data::subgraph::schema::generate_entity_id, prelude::StoreEvent};
+use maybe_owned::MaybeOwned;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     convert::TryFrom,
     convert::TryInto,
     fmt,
-    iter::FromIterator,
+    io::Write,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -43,7 +46,7 @@ use crate::{
     block_range::UNVERSIONED_RANGE,
     detail::DeploymentDetail,
     notification_listener::JsonNotification,
-    sharded_store::{unused, Shard},
+    subgraph_store::{unused, Shard},
 };
 
 #[cfg(debug_assertions)]
@@ -95,6 +98,13 @@ table! {
     }
 }
 
+table! {
+    public.ens_names(hash) {
+        hash -> Varchar,
+        name -> Varchar,
+    }
+}
+
 /// We used to support different layout schemes. The old 'Split' scheme
 /// which used JSONB layout has been removed, and we will only deal
 /// with relational layout. Trying to do anything with a 'Split' subgraph
@@ -113,7 +123,7 @@ table! {
         shard -> Text,
         /// The subgraph layout scheme used for this subgraph
         version -> crate::primary::DeploymentSchemaVersionMapping,
-        network -> Nullable<Text>,
+        network -> Text,
     }
 }
 
@@ -163,7 +173,7 @@ struct Schema {
     /// The version currently in use. Always `Relational`, attempts to load
     /// schemas from the database with `Split` produce an error
     version: DeploymentSchemaVersion,
-    pub network: Option<String>,
+    pub network: String,
 }
 
 #[derive(Clone, Queryable, QueryableByName, Debug)]
@@ -184,7 +194,8 @@ pub struct UnusedDeployment {
     pub synced: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, AsExpression, FromSqlRow)]
+#[sql_type = "diesel::sql_types::Text"]
 /// A namespace (schema) in the database
 pub struct Namespace(String);
 
@@ -226,6 +237,19 @@ impl fmt::Display for Namespace {
     }
 }
 
+impl FromSql<Text, Pg> for Namespace {
+    fn from_sql(bytes: Option<&[u8]>) -> diesel::deserialize::Result<Self> {
+        let s = <String as FromSql<Text, Pg>>::from_sql(bytes)?;
+        Namespace::new(s).map_err(Into::into)
+    }
+}
+
+impl ToSql<Text, Pg> for Namespace {
+    fn to_sql<W: Write>(&self, out: &mut Output<W, Pg>) -> diesel::serialize::Result {
+        <String as ToSql<Text, Pg>>::to_sql(&self.0, out)
+    }
+}
+
 #[derive(Debug)]
 /// Details about a deployment and the shard in which it is stored. We need
 /// the database namespace for the deployment as that information is only
@@ -237,6 +261,8 @@ pub struct Site {
     pub shard: Shard,
     /// The database namespace (schema) that holds the data for the deployment
     pub namespace: Namespace,
+    /// The name of the network to which this deployment belongs
+    pub network: String,
 }
 
 impl TryFrom<Schema> for Site {
@@ -257,17 +283,20 @@ impl TryFrom<Schema> for Site {
             deployment,
             namespace,
             shard,
+            network: schema.network,
         })
     }
 }
 
 /// A wrapper for a database connection that provides access to functionality
 /// that works only on the primary database
-pub struct Connection(PooledConnection<ConnectionManager<PgConnection>>);
+pub struct Connection<'a>(MaybeOwned<'a, PooledConnection<ConnectionManager<PgConnection>>>);
 
-impl Connection {
-    pub fn new(conn: PooledConnection<ConnectionManager<PgConnection>>) -> Self {
-        Self(conn)
+impl<'a> Connection<'a> {
+    pub fn new(
+        conn: impl Into<MaybeOwned<'a, PooledConnection<ConnectionManager<PgConnection>>>>,
+    ) -> Self {
+        Self(conn.into())
     }
 
     pub(crate) fn transaction<T, E, F>(&self, f: F) -> Result<T, E>
@@ -289,7 +318,7 @@ impl Connection {
             .inner_join(s::table.on(s::current_version.eq(v::id.nullable())))
             .filter(s::name.eq(name.as_str()))
             .select(v::deployment)
-            .first::<String>(&self.0)
+            .first::<String>(self.0.as_ref())
             .optional()?;
         match id {
             Some(id) => SubgraphDeploymentId::new(id)
@@ -319,7 +348,7 @@ impl Connection {
         }
 
         Ok(diesel::sql_query(QUERY)
-            .load::<Removed>(&self.0)?
+            .load::<Removed>(self.0.as_ref())?
             .into_iter()
             .map(|r| {
                 SubgraphDeploymentId::new(r.id.clone())
@@ -348,7 +377,7 @@ impl Connection {
         use subgraph as s;
         use subgraph_version as v;
 
-        let conn = &self.0;
+        let conn = self.0.as_ref();
 
         // Subgraphs where we need to promote the version
         let pending_subgraph_versions: Vec<(String, String)> = s::table
@@ -384,7 +413,7 @@ impl Connection {
     pub fn create_subgraph(&self, name: &SubgraphName) -> Result<String, StoreError> {
         use subgraph as s;
 
-        let conn = &self.0;
+        let conn = self.0.as_ref();
         let id = generate_entity_id();
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -428,7 +457,7 @@ impl Connection {
         use subgraph_version as v;
         use SubgraphVersionSwitchingMode::*;
 
-        let conn = &self.0;
+        let conn = self.0.as_ref();
 
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -544,7 +573,7 @@ impl Connection {
         use subgraph as s;
         use subgraph_version as v;
 
-        let conn = &self.0;
+        let conn = self.0.as_ref();
 
         // Get the id of the given subgraph. If no subgraph with the
         // name exists, there is nothing to do
@@ -567,7 +596,7 @@ impl Connection {
 
         Ok(
             diesel::select(exists(s::table.filter(s::name.eq(name.as_str()))))
-                .get_result::<bool>(&self.0)?,
+                .get_result::<bool>(self.0.as_ref())?,
         )
     }
 
@@ -578,7 +607,7 @@ impl Connection {
     ) -> Result<Vec<EntityChange>, StoreError> {
         use subgraph_deployment_assignment as a;
 
-        let conn = &self.0;
+        let conn = self.0.as_ref();
         let updates = update(a::table.filter(a::id.eq(id.as_str())))
             .set(a::node_id.eq(node.as_str()))
             .execute(conn)?;
@@ -607,7 +636,7 @@ impl Connection {
     ) -> Result<Vec<EntityChange>, StoreError> {
         use subgraph_deployment_assignment as a;
 
-        let conn = &self.0;
+        let conn = self.0.as_ref();
         let delete_count = delete(a::table.filter(a::id.eq(id.as_str()))).execute(conn)?;
 
         match delete_count {
@@ -630,12 +659,12 @@ impl Connection {
         &self,
         shard: Shard,
         subgraph: &SubgraphDeploymentId,
-        network_name: &str,
+        network: String,
     ) -> Result<Site, StoreError> {
         use deployment_schemas as ds;
         use DeploymentSchemaVersion as v;
 
-        let conn = &self.0;
+        let conn = self.0.as_ref();
 
         if let Some(schema) = self.find_site(subgraph)? {
             return Ok(schema);
@@ -647,7 +676,7 @@ impl Connection {
                 ds::subgraph.eq(subgraph.as_str()),
                 ds::shard.eq(shard.as_str()),
                 ds::version.eq(v::Relational),
-                ds::network.eq(network_name),
+                ds::network.eq(network.as_str()),
             ))
             .returning(ds::name)
             .get_results(conn)?;
@@ -663,6 +692,7 @@ impl Connection {
             deployment: subgraph.clone(),
             namespace,
             shard,
+            network,
         })
     }
 
@@ -674,11 +704,11 @@ impl Connection {
         use unused_deployments as u;
 
         self.transaction(|| {
-            delete(v::table.filter(v::deployment.eq(id.as_str()))).execute(&self.0)?;
-            delete(ds::table.filter(ds::subgraph.eq(id.as_str()))).execute(&self.0)?;
+            delete(v::table.filter(v::deployment.eq(id.as_str()))).execute(self.0.as_ref())?;
+            delete(ds::table.filter(ds::subgraph.eq(id.as_str()))).execute(self.0.as_ref())?;
             update(u::table.filter(u::id.eq(id.as_str())))
                 .set(u::removed_at.eq(sql("now()")))
-                .execute(&self.0)?;
+                .execute(self.0.as_ref())?;
             Ok(())
         })
     }
@@ -686,7 +716,7 @@ impl Connection {
     pub fn find_site(&self, subgraph: &SubgraphDeploymentId) -> Result<Option<Site>, StoreError> {
         let schema = deployment_schemas::table
             .filter(deployment_schemas::subgraph.eq(subgraph.to_string()))
-            .first::<Schema>(&self.0)
+            .first::<Schema>(self.0.as_ref())
             .optional()?;
         if let Some(Schema { version, .. }) = schema {
             if matches!(version, DeploymentSchemaVersion::Split) {
@@ -703,7 +733,7 @@ impl Connection {
         let ids: Vec<_> = ids.iter().map(|id| id.to_string()).collect();
         let schemas = deployment_schemas::table
             .filter(deployment_schemas::subgraph.eq_any(ids))
-            .load::<Schema>(&self.0)?;
+            .load::<Schema>(self.0.as_ref())?;
         schemas
             .into_iter()
             .map(|schema| {
@@ -732,7 +762,7 @@ impl Connection {
 
         ds::table
             .filter(ds::name.ne("subgraphs"))
-            .load::<Schema>(&self.0)?
+            .load::<Schema>(self.0.as_ref())?
             .into_iter()
             .map(|schema| schema.try_into())
             .collect()
@@ -750,7 +780,7 @@ impl Connection {
                 EVENT_TAP.lock().unwrap().push(event.clone());
             }
         }
-        JsonNotification::send("store_events", &v, &self.0)
+        JsonNotification::send("store_events", &v, self.0.as_ref())
     }
 
     /// Return the name of the node that has the fewest assignments out of the
@@ -765,7 +795,7 @@ impl Connection {
             .select((a::node_id, sql("count(*)")))
             .group_by(a::node_id)
             .order_by(sql::<i64>("count(*)"))
-            .load::<(String, i64)>(&self.0)?;
+            .load::<(String, i64)>(self.0.as_ref())?;
 
         // Any nodes without assignments will be missing from `assigned`
         let missing = nodes
@@ -792,7 +822,7 @@ impl Connection {
         a::table
             .filter(a::id.eq(id.as_str()))
             .select(a::node_id)
-            .first::<String>(&self.0)
+            .first::<String>(self.0.as_ref())
             .optional()?
             .map(|node| {
                 NodeId::new(&node).map_err(|()| {
@@ -808,7 +838,7 @@ impl Connection {
         a::table
             .filter(a::node_id.eq(node.as_str()))
             .select(a::id)
-            .load::<String>(&self.0)?
+            .load::<String>(self.0.as_ref())?
             .into_iter()
             .map(|id| {
                 SubgraphDeploymentId::new(id).map_err(|id| {
@@ -832,71 +862,13 @@ impl Connection {
         let nodes: HashMap<_, _> = a::table
             .filter(a::id.eq(any(ids)))
             .select((a::id, a::node_id))
-            .load::<(String, String)>(&self.0)?
+            .load::<(String, String)>(self.0.as_ref())?
             .into_iter()
             .collect();
         for mut info in &mut infos {
             info.node = nodes.get(&info.subgraph).map(|s| s.clone());
         }
         Ok(infos)
-    }
-
-    pub fn fill_chain_head_pointers(
-        &self,
-        mut infos: Vec<status::Info>,
-    ) -> Result<Vec<status::Info>, StoreError> {
-        use crate::db_schema::ethereum_networks as n;
-        let networks: Vec<_> = infos
-            .iter()
-            .map(|info| info.chains.iter().map(|chain| &chain.network))
-            .flatten()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let pointers: Vec<(String, EthereumBlockPointer)> = n::table
-            .filter(n::name.eq(any(networks)))
-            .select((n::name, n::head_block_hash, n::head_block_number))
-            .load::<(String, Option<String>, Option<i64>)>(&self.0)?
-            .into_iter()
-            .filter_map(|(name, hash, number)| match (hash, number) {
-                (Some(hash), Some(number)) => Some((name, hash, number)),
-                _ => None,
-            })
-            .map(|(name, hash, number)| {
-                EthereumBlockPointer::try_from((hash.as_str(), number)).map(|ptr| (name, ptr))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let pointers: HashMap<_, _> = HashMap::from_iter(pointers);
-        for info in &mut infos {
-            for chain in &mut info.chains {
-                chain.chain_head_block = pointers
-                    .get(&chain.network)
-                    .map(|ptr| ptr.to_owned().into());
-            }
-        }
-        Ok(infos)
-    }
-
-    pub fn chain_head_block(&self, network: &str) -> Result<Option<u64>, StoreError> {
-        use crate::db_schema::ethereum_networks as n;
-
-        let number: Option<i64> = n::table
-            .filter(n::name.eq(network))
-            .select(n::head_block_number)
-            .first::<Option<i64>>(&self.0)
-            .optional()?
-            .flatten();
-
-        number.map(|number| number.try_into()).transpose().map_err(
-            |e: std::num::TryFromIntError| {
-                constraint_violation!(
-                    "head block number for {} is {:?} which does not fit into a u32: {}",
-                    network,
-                    number,
-                    e.to_string()
-                )
-            },
-        )
     }
 
     pub(crate) fn deployments_for_subgraph(&self, name: String) -> Result<Vec<String>, StoreError> {
@@ -908,7 +880,7 @@ impl Connection {
             .filter(s::name.eq(&name))
             .order_by(v::created_at.asc())
             .select(v::deployment)
-            .load(&self.0)?)
+            .load(self.0.as_ref())?)
     }
 
     pub fn subgraph_version(
@@ -924,13 +896,13 @@ impl Connection {
                 .select(v::deployment.nullable())
                 .inner_join(s::table.on(s::current_version.eq(v::id.nullable())))
                 .filter(s::name.eq(&name))
-                .first::<Option<String>>(&self.0)
+                .first::<Option<String>>(self.0.as_ref())
         } else {
             v::table
                 .select(v::deployment.nullable())
                 .inner_join(s::table.on(s::pending_version.eq(v::id.nullable())))
                 .filter(s::name.eq(&name))
-                .first::<Option<String>>(&self.0)
+                .first::<Option<String>>(self.0.as_ref())
         };
         Ok(deployment.optional()?.flatten())
     }
@@ -945,7 +917,7 @@ impl Connection {
         Ok(s::table
             .select((s::current_version.nullable(), s::pending_version.nullable()))
             .filter(s::name.eq(&name))
-            .first::<(Option<String>, Option<String>)>(&self.0)
+            .first::<(Option<String>, Option<String>)>(self.0.as_ref())
             .optional()?
             .unwrap_or((None, None)))
     }
@@ -957,7 +929,7 @@ impl Connection {
         Ok(v::table
             .select(v::deployment)
             .filter(v::id.eq(name))
-            .first::<String>(&self.0)
+            .first::<String>(self.0.as_ref())
             .optional()?)
     }
 
@@ -967,7 +939,7 @@ impl Connection {
         Ok(v::table
             .select((v::deployment, sql("created_at::text")))
             .filter(v::id.eq(version))
-            .first::<(String, String)>(&self.0)
+            .first::<(String, String)>(self.0.as_ref())
             .optional()?)
     }
 
@@ -980,7 +952,7 @@ impl Connection {
         Ok(s::table
             .select((s::current_version.nullable(), s::pending_version.nullable()))
             .filter(s::id.eq(subgraph_id))
-            .first::<(Option<String>, Option<String>)>(&self.0)
+            .first::<(Option<String>, Option<String>)>(self.0.as_ref())
             .optional()?
             .unwrap_or((None, None)))
     }
@@ -1024,7 +996,7 @@ impl Connection {
             .on_conflict(u::id)
             .do_nothing()
             .returning(u::id)
-            .get_results::<String>(&self.0)?)
+            .get_results::<String>(self.0.as_ref())?)
     }
 
     /// Add details from the deployment shard to unuseddeployments
@@ -1060,7 +1032,7 @@ impl Connection {
                     u::failed.eq(detail.failed),
                     u::synced.eq(detail.synced),
                 ))
-                .execute(&self.0)?;
+                .execute(self.0.as_ref())?;
         }
         Ok(())
     }
@@ -1073,11 +1045,13 @@ impl Connection {
         use unused_deployments as u;
 
         match filter {
-            All => Ok(u::table.order_by(u::unused_at.desc()).load(&self.0)?),
+            All => Ok(u::table
+                .order_by(u::unused_at.desc())
+                .load(self.0.as_ref())?),
             New => Ok(u::table
                 .filter(u::removed_at.is_null())
                 .order_by(u::entity_count)
-                .load(&self.0)?),
+                .load(self.0.as_ref())?),
         }
     }
 
@@ -1098,6 +1072,17 @@ impl Connection {
             .filter(v::deployment.eq(id.as_str()))
             .select(s::name)
             .distinct()
-            .load(&self.0)?)
+            .load(self.0.as_ref())?)
+    }
+
+    pub fn find_ens_name(&self, hash: &str) -> Result<Option<String>, StoreError> {
+        use ens_names as dsl;
+
+        dsl::table
+            .select(dsl::name)
+            .find(hash)
+            .get_result::<String>(self.0.as_ref())
+            .optional()
+            .map_err(|e| anyhow!("error looking up ens_name for hash {}: {}", hash, e).into())
     }
 }

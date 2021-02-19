@@ -533,6 +533,11 @@ impl WasmInstance {
         link!("bigInt.dividedByDecimal", big_int_divided_by_decimal, x, y);
         link!("bigInt.mod", big_int_mod, x_ptr, y_ptr);
         link!("bigInt.pow", big_int_pow, x_ptr, exp);
+        link!("bigInt.fromString", big_int_from_string, ptr);
+        link!("bigInt.bitOr", big_int_bit_or, x_ptr, y_ptr);
+        link!("bigInt.bitAnd", big_int_bit_and, x_ptr, y_ptr);
+        link!("bigInt.leftShift", big_int_left_shift, x_ptr, bits);
+        link!("bigInt.rightShift", big_int_right_shift, x_ptr, bits);
 
         link!("bigDecimal.toString", big_decimal_to_string, ptr);
         link!("bigDecimal.fromString", big_decimal_from_string, ptr);
@@ -884,6 +889,18 @@ impl WasmInstanceContext {
         self.asc_new(&n.to_string())
     }
 
+    /// function bigInt.fromString(x: string): BigInt
+    fn big_int_from_string(
+        &mut self,
+        string_ptr: AscPtr<AscString>,
+    ) -> Result<AscPtr<AscBigInt>, DeterministicHostError> {
+        let result = self
+            .ctx
+            .host_exports
+            .big_int_from_string(self.asc_get(string_ptr)?)?;
+        self.asc_new(&result)
+    }
+
     /// function typeConversion.bigIntToHex(n: Uint8Array): string
     fn big_int_to_hex(
         &mut self,
@@ -1147,6 +1164,60 @@ impl WasmInstanceContext {
             .ctx
             .host_exports
             .big_int_pow(self.asc_get(x_ptr)?, exp)?;
+        self.asc_new(&result)
+    }
+
+    /// function bigInt.bitOr(x: BigInt, y: BigInt): BigInt
+    fn big_int_bit_or(
+        &mut self,
+        x_ptr: AscPtr<AscBigInt>,
+        y_ptr: AscPtr<AscBigInt>,
+    ) -> Result<AscPtr<AscBigInt>, DeterministicHostError> {
+        let result = self
+            .ctx
+            .host_exports
+            .big_int_bit_or(self.asc_get(x_ptr)?, self.asc_get(y_ptr)?)?;
+        self.asc_new(&result)
+    }
+
+    /// function bigInt.bitAnd(x: BigInt, y: BigInt): BigInt
+    fn big_int_bit_and(
+        &mut self,
+        x_ptr: AscPtr<AscBigInt>,
+        y_ptr: AscPtr<AscBigInt>,
+    ) -> Result<AscPtr<AscBigInt>, DeterministicHostError> {
+        let result = self
+            .ctx
+            .host_exports
+            .big_int_bit_and(self.asc_get(x_ptr)?, self.asc_get(y_ptr)?)?;
+        self.asc_new(&result)
+    }
+
+    /// function bigInt.leftShift(x: BigInt, bits: u8): BigInt
+    fn big_int_left_shift(
+        &mut self,
+        x_ptr: AscPtr<AscBigInt>,
+        bits: u32,
+    ) -> Result<AscPtr<AscBigInt>, DeterministicHostError> {
+        let bits = u8::try_from(bits).map_err(|e| DeterministicHostError(e.into()))?;
+        let result = self
+            .ctx
+            .host_exports
+            .big_int_left_shift(self.asc_get(x_ptr)?, bits)?;
+        self.asc_new(&result)
+    }
+
+    /// function bigInt.rightShift(x: BigInt, bits: u8): BigInt
+    fn big_int_right_shift(
+        &mut self,
+        x_ptr: AscPtr<AscBigInt>,
+        bits: u32,
+    ) -> Result<AscPtr<AscBigInt>, DeterministicHostError> {
+        let bits = u8::try_from(bits).map_err(|e| DeterministicHostError(e.into()))?;
+        let result = self
+            .ctx
+            .host_exports
+            .big_int_right_shift(self.asc_get(x_ptr)?, bits)?;
         self.asc_new(&result)
     }
 

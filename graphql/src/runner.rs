@@ -95,7 +95,7 @@ where
     /// would affect a query that looked at data as fresh as `latest_block`.
     /// If the subgraph did change, return the `Err` that should be sent back
     /// to clients to indicate that condition
-    fn deployment_changed(
+    async fn deployment_changed(
         &self,
         store: &dyn QueryStore,
         state: DeploymentState,
@@ -104,7 +104,7 @@ where
         if *GRAPHQL_ALLOW_DEPLOYMENT_CHANGE {
             return Ok(());
         }
-        let new_state = store.deployment_state()?;
+        let new_state = store.deployment_state().await?;
         assert!(new_state.reorg_count >= state.reorg_count);
         if new_state.reorg_count > state.reorg_count {
             // One or more reorgs happened; each reorg can't have gone back
@@ -140,12 +140,9 @@ where
         // while the query is running. `self.store` can not be used after this
         // point, and everything needs to go through the `store` we are
         // setting up here
-        let store = self
-            .store
-            .query_store(target, false)
-            .map_err(|e| QueryExecutionError::from(e))?;
-        let state = store.deployment_state()?;
-        let network = store.network_name()?;
+        let store = self.store.query_store(target, false).await?;
+        let state = store.deployment_state().await?;
+        let network = Some(store.network_name().to_string());
         let schema = store.api_schema()?;
 
         // Test only, see c435c25decbc4ad7bbbadf8e0ced0ff2
@@ -207,6 +204,7 @@ where
 
         query.log_execution(max_block);
         self.deployment_changed(store.as_ref(), state, max_block as u64)
+            .await
             .map_err(QueryResults::from)
             .map(|()| result)
     }
@@ -264,14 +262,14 @@ where
         subscription: Subscription,
         target: QueryTarget,
     ) -> Result<SubscriptionResult, SubscriptionError> {
-        let store = self.store.query_store(target, true)?;
+        let store = self.store.query_store(target, true).await?;
         let schema = store.api_schema()?;
-        let network = store.network_name()?;
+        let network = store.network_name().to_string();
 
         let query = crate::execution::Query::new(
             &self.logger,
             schema,
-            network,
+            Some(network.clone()),
             subscription.query,
             *GRAPHQL_MAX_COMPLEXITY,
             *GRAPHQL_MAX_DEPTH,

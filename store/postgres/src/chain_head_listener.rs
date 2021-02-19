@@ -1,10 +1,20 @@
+use diesel::RunQueryDsl;
+use lazy_static::lazy_static;
 use tokio::sync::watch;
 use web3::types::H256;
 
-use crate::notification_listener::{NotificationListener, SafeChannelName};
-use graph::prelude::serde_json;
+use crate::{
+    connection_pool::ConnectionPool,
+    notification_listener::{NotificationListener, SafeChannelName},
+};
+use graph::prelude::serde_json::{self, json};
 use graph::prelude::{ChainHeadUpdateListener as ChainHeadUpdateListenerTrait, *};
 use graph_chain_ethereum::BlockIngestorMetrics;
+
+lazy_static! {
+    pub static ref CHANNEL_NAME: SafeChannelName =
+        SafeChannelName::i_promise_this_is_safe("chain_head_updates");
+}
 
 pub struct ChainHeadUpdateListener {
     /// A receiver that gets all chain head updates for all networks. We
@@ -20,17 +30,20 @@ pub struct ChainHeadUpdateListener {
     _listener: NotificationListener,
 }
 
+/// Sender for messages that the `ChainHeadUpdateListener` on other nodes
+/// will receive. The sender is specific to a particular chain.
+pub(crate) struct ChainHeadUpdateSender {
+    pool: ConnectionPool,
+    chain_name: String,
+}
+
 impl ChainHeadUpdateListener {
     pub fn new(logger: &Logger, registry: Arc<dyn MetricsRegistry>, postgres_url: String) -> Self {
         let logger = logger.new(o!("component" => "ChainHeadUpdateListener"));
         let ingestor_metrics = Arc::new(BlockIngestorMetrics::new(registry.clone()));
 
         // Create a Postgres notification listener for chain head updates
-        let mut listener = NotificationListener::new(
-            &logger,
-            postgres_url,
-            SafeChannelName::i_promise_this_is_safe("chain_head_updates"),
-        );
+        let mut listener = NotificationListener::new(&logger, postgres_url, CHANNEL_NAME.clone());
 
         let none_update = ChainHeadUpdate {
             network_name: "none".to_owned(),
@@ -106,5 +119,30 @@ impl ChainHeadUpdateListenerTrait for ChainHeadUpdateListener {
                 .boxed()
                 .compat(),
         )
+    }
+}
+
+impl ChainHeadUpdateSender {
+    pub fn new(pool: ConnectionPool, network_name: String) -> Self {
+        Self {
+            pool,
+            chain_name: network_name,
+        }
+    }
+
+    pub fn send(&self, hash: &str, number: i64) -> Result<(), StoreError> {
+        use crate::functions::pg_notify;
+
+        let msg = json! ({
+            "network_name": &self.chain_name,
+            "head_block_hash": hash,
+            "head_block_number": number
+        });
+
+        let conn = self.pool.get()?;
+        diesel::select(pg_notify(CHANNEL_NAME.as_str(), &msg.to_string()))
+            .execute(&conn)
+            .map_err(StoreError::from)
+            .map(|_| ())
     }
 }

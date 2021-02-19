@@ -12,7 +12,7 @@ use graph_chain_ethereum::network_indexer::{
     self as network_indexer, BlockWithOmmers, NetworkIndexerEvent,
 };
 use graph_core::MetricsRegistry;
-use graph_store_postgres::NetworkStore as DieselStore;
+use graph_store_postgres::Store as DieselStore;
 use web3::types::{H2048, H256, H64, U256};
 
 use test_store::*;
@@ -35,6 +35,7 @@ macro_rules! revert {
 // Helper to wipe the store clean.
 fn remove_test_data(store: Arc<DieselStore>) {
     store
+        .subgraph_store()
         .delete_all_entities_for_test_use_only()
         .expect("removing test data succeeds");
 }
@@ -64,7 +65,7 @@ fn run_network_indexer(
     let mut indexer = network_indexer::NetworkIndexer::new(
         &logger,
         adapter,
-        store.clone(),
+        store.subgraph_store(),
         metrics_registry,
         subgraph_name.to_string(),
         start_block,

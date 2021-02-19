@@ -12,10 +12,13 @@ use std::{
 };
 
 use graph::{
-    components::server::{index_node::VersionInfo, query::GraphQLServerError},
+    components::{
+        server::{index_node::VersionInfo, query::GraphQLServerError},
+        store::StatusStore,
+    },
     data::subgraph::status,
     object,
-    prelude::{lazy_static, q, serde_json, warn, Logger, SerializableValue, Store},
+    prelude::{lazy_static, q, serde_json, warn, Logger, SerializableValue},
 };
 
 lazy_static! {
@@ -75,7 +78,7 @@ pub struct Explorer<S> {
 
 impl<S> Explorer<S>
 where
-    S: Store,
+    S: StatusStore,
 {
     pub fn new(store: Arc<S>) -> Self {
         Self {
@@ -137,7 +140,7 @@ where
             description: vi.description.as_ref().map(|s| s.as_str()),
             repository: vi.repository.as_ref().map(|s| s.as_str()),
             schema: vi.schema.document.to_string(),
-            network: vi.network.as_ref().map(|s| s.as_str())
+            network: vi.network.as_str()
         };
         Ok(as_http_response(&value))
     }

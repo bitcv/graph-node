@@ -1,20 +1,20 @@
 use std::{env, sync::Arc};
 
 use git_testament::{git_testament, render_testament};
+use graph::prometheus::Registry;
 use graph_core::MetricsRegistry;
 use lazy_static::lazy_static;
-use prometheus::Registry;
 use structopt::StructOpt;
 
 use graph::{
     log::logger,
-    prelude::{info, o, slog, tokio, Logger},
+    prelude::{info, o, slog, tokio, Logger, NodeId},
 };
 use graph_node::config;
 use graph_node::store_builder::StoreBuilder;
-use graph_store_postgres::{connection_pool::ConnectionPool, ShardedStore, PRIMARY_SHARD};
+use graph_store_postgres::{connection_pool::ConnectionPool, SubgraphStore, PRIMARY_SHARD};
 
-use crate::config::Config;
+use crate::config::Config as Cfg;
 use graph_node::manager::commands;
 
 git_testament!(TESTAMENT);
@@ -41,10 +41,19 @@ lazy_static! {
 pub struct Opt {
     #[structopt(
         long,
+        short,
         env = "GRAPH_NODE_CONFIG",
         help = "the name of the configuration file"
     )]
     pub config: String,
+    #[structopt(
+        long,
+        default_value = "default",
+        value_name = "NODE_ID",
+        env = "GRAPH_NODE_ID",
+        help = "a unique identifier for this node"
+    )]
+    pub node_id: String,
     #[structopt(subcommand)]
     pub cmd: Command,
 }
@@ -70,13 +79,33 @@ pub enum Command {
         #[structopt(long, short)]
         used: bool,
     },
-    /// Print how a specific subgraph would be placed
-    Place { name: String, network: String },
     /// Manage unused deployments
     ///
     /// Record which deployments are unused with `record`, then remove them
     /// with `remove`
     Unused(UnusedCommand),
+    /// Remove a named subgraph
+    Remove {
+        /// The name of the subgraph to remove
+        name: String,
+    },
+    /// Assign or reassign a deployment
+    Reassign {
+        /// The id of the deployment to reassign
+        id: String,
+        /// The name of the node that should index the deployment
+        node: String,
+    },
+    /// Unassign a deployment
+    Unassign {
+        /// The id of the deployment to unassign
+        id: String,
+    },
+    /// Check and interrogate the configuration
+    ///
+    /// Print information about a configuration file without
+    /// actually connecting to databases or network clients
+    Config(ConfigCommand),
 }
 
 #[derive(Clone, Debug, StructOpt)]
@@ -103,6 +132,31 @@ pub enum UnusedCommand {
     },
 }
 
+#[derive(Clone, Debug, StructOpt)]
+pub enum ConfigCommand {
+    /// Check and validate the configuration file
+    Check {
+        /// Print the configuration as JSON
+        #[structopt(long)]
+        print: bool,
+    },
+    /// Print how a specific subgraph would be placed
+    Place {
+        /// The name of the subgraph
+        name: String,
+        /// The network the subgraph indexes
+        network: String,
+    },
+    /// Information about the size of database pools
+    Pools {
+        /// The names of the nodes that are going to run
+        nodes: Vec<String>,
+        /// Print connections by shard rather than by node
+        #[structopt(short, long)]
+        shard: bool,
+    },
+}
+
 impl From<Opt> for config::Opt {
     fn from(opt: Opt) -> Self {
         let mut config_opt = config::Opt::default();
@@ -120,18 +174,19 @@ fn make_registry(logger: &Logger) -> Arc<MetricsRegistry> {
     ))
 }
 
-fn make_main_pool(logger: &Logger, config: &Config) -> ConnectionPool {
+fn make_main_pool(logger: &Logger, node_id: &NodeId, config: &Cfg) -> ConnectionPool {
     let primary = config.primary_store();
     StoreBuilder::main_pool(
         &logger,
+        node_id,
         PRIMARY_SHARD.as_str(),
         primary,
         make_registry(logger),
     )
 }
 
-fn make_store(logger: &Logger, config: &Config) -> Arc<ShardedStore> {
-    StoreBuilder::make_sharded_store(logger, config, make_registry(logger))
+fn make_store(logger: &Logger, node_id: &NodeId, config: &Cfg) -> Arc<SubgraphStore> {
+    StoreBuilder::make_sharded_store(logger, node_id, config, make_registry(logger))
 }
 
 #[tokio::main]
@@ -151,18 +206,27 @@ async fn main() {
         render_testament!(TESTAMENT)
     );
 
-    let config = match Config::load(&logger, &opt.clone().into()) {
+    let config = match Cfg::load(&logger, &opt.clone().into()) {
         Err(e) => {
             eprintln!("configuration error: {}", e);
             std::process::exit(1);
         }
         Ok(config) => config,
     };
+    let node = match NodeId::new(&opt.node_id) {
+        Err(()) => {
+            eprintln!("invalid node id: {}", opt.node_id);
+            std::process::exit(1);
+        }
+        Ok(node) => node,
+    };
+    let make_main_pool = || make_main_pool(&logger, &node, &config);
+    let make_store = || make_store(&logger, &node, &config);
 
     use Command::*;
     let result = match opt.cmd {
         TxnSpeed { delay } => {
-            let pool = make_main_pool(&logger, &config);
+            let pool = make_main_pool();
             commands::txn_speed::run(pool, delay)
         }
         Info {
@@ -171,12 +235,11 @@ async fn main() {
             pending,
             used,
         } => {
-            let pool = make_main_pool(&logger, &config);
+            let pool = make_main_pool();
             commands::info::run(pool, name, current, pending, used)
         }
-        Place { name, network } => commands::place::run(&config.deployment, &name, &network),
         Unused(cmd) => {
-            let store = make_store(&logger, &config);
+            let store = make_store();
             use UnusedCommand::*;
 
             match cmd {
@@ -187,6 +250,29 @@ async fn main() {
                     commands::unused_deployments::remove(store, count, deployment)
                 }
             }
+        }
+        Config(cmd) => {
+            use ConfigCommand::*;
+
+            match cmd {
+                Place { name, network } => {
+                    commands::config::place(&config.deployment, &name, &network)
+                }
+                Check { print } => commands::config::check(&config, print),
+                Pools { nodes, shard } => commands::config::pools(&config, nodes, shard),
+            }
+        }
+        Remove { name } => {
+            let store = make_store();
+            commands::remove::run(store, name)
+        }
+        Unassign { id } => {
+            let store = make_store();
+            commands::assign::unassign(store, id)
+        }
+        Reassign { id, node } => {
+            let store = make_store();
+            commands::assign::reassign(store, id, node)
         }
     };
     if let Err(e) = result {
