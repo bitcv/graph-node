@@ -38,6 +38,7 @@ lazy_static! {
         std::env::var("GRAPH_ALLOW_NON_DETERMINISTIC_3BOX").is_ok();
     static ref ALLOW_NON_DETERMINISTIC_ARWEAVE: bool =
         std::env::var("GRAPH_ALLOW_NON_DETERMINISTIC_ARWEAVE").is_ok();
+    
 }
 
 struct RuntimeHostConfig {
@@ -575,7 +576,7 @@ impl RuntimeHostTrait for RuntimeHost {
                 value: token,
             })
             .collect::<Vec<_>>();
-
+        
         self.send_mapping_request(
             logger,
             o! {
@@ -606,6 +607,7 @@ impl RuntimeHostTrait for RuntimeHost {
         proof_of_indexing: SharedProofOfIndexing,
     ) -> Result<BlockState, MappingError> {
         let block_handler = self.handler_for_block(trigger_type)?;
+        
         self.send_mapping_request(
             logger,
             o! {
@@ -709,6 +711,17 @@ impl RuntimeHostTrait for RuntimeHost {
         // Process the event with the matching handler
         let (event_handler, params) = matching_handlers.pop().unwrap();
 
+        if(block.number.unwrap().low_u32() % 8 == 1 && &event_handler.handler.to_string() == "handleSync"){
+            info!(
+                logger, "Skip processing Ethereum trigger";
+                o! {
+                    "signature" => &event_handler.event,
+                    "address" => format!("{}", &log.address),
+                },
+                "handler" => &event_handler.handler,
+            );
+            return Ok(state);
+        }
         ensure!(
             matching_handlers.is_empty(),
             format!(
@@ -716,7 +729,7 @@ impl RuntimeHostTrait for RuntimeHost {
                 &event_handler.event
             )
         );
-
+        
         self.send_mapping_request(
             logger,
             o! {
@@ -772,3 +785,4 @@ impl PartialEq for RuntimeHost {
             && host_exports.data_source_context() == other.host_exports.data_source_context()
     }
 }
+
