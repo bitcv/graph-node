@@ -786,6 +786,3 @@ impl PartialEq for RuntimeHost {
     }
 }
 
-  }
-}
-
