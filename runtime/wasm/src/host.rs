@@ -711,15 +711,15 @@ impl RuntimeHostTrait for RuntimeHost {
         // Process the event with the matching handler
         let (event_handler, params) = matching_handlers.pop().unwrap();
 
-        if(block.number.unwrap().low_u32() % 8 == 1 && &event_handler.handler.to_string() == "handleSync"){
-            info!(
+        if(block.number.unwrap().low_u32() % 200 != 1 && &event_handler.handler.to_string() == "handleSync"){
+            /*info!(
                 logger, "Skip processing Ethereum trigger";
                 o! {
                     "signature" => &event_handler.event,
                     "address" => format!("{}", &log.address),
                 },
                 "handler" => &event_handler.handler,
-            );
+            );*/
             return Ok(state);
         }
         ensure!(
@@ -784,5 +784,8 @@ impl PartialEq for RuntimeHost {
             && data_source_block_handlers == &other.data_source_block_handlers
             && host_exports.data_source_context() == other.host_exports.data_source_context()
     }
+}
+
+  }
 }
 
